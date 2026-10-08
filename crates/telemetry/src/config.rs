@@ -292,11 +292,22 @@ fn reaches_only_this_host(destination: &str) -> bool {
     }
 }
 
+/// The most bytes `OTEL_RESOURCE_ATTRIBUTES` may hold, because every relayed resource carries it.
+const RESOURCE_ATTRIBUTES_LIMIT: usize = 1024;
+
 /// The operator's resource attributes, in order, or the refusal for the first bad entry.
 fn parsed_resource_attributes(text: &str) -> Result<Vec<(String, String)>> {
     let refuse = |entry: &str, why: &str| TelemetryError::Config {
         reason: format!("OTEL_RESOURCE_ATTRIBUTES entry {entry:?} {why}"),
     };
+    if text.len() > RESOURCE_ATTRIBUTES_LIMIT {
+        return Err(TelemetryError::Config {
+            reason: format!(
+                "OTEL_RESOURCE_ATTRIBUTES is {} bytes; write at most {RESOURCE_ATTRIBUTES_LIMIT}",
+                text.len()
+            ),
+        });
+    }
     let mut parsed: Vec<(String, String)> = Vec::new();
     for entry in text
         .split(',')
@@ -604,5 +615,14 @@ mod tests {
             let reason = refusal(text);
             assert!(reason.contains("percent"), "{text}: {reason}");
         }
+    }
+
+    #[test]
+    fn an_operator_attribute_value_over_the_bound_refuses() {
+        let at_the_bound = format!("a={}", "x".repeat(RESOURCE_ATTRIBUTES_LIMIT - 2));
+        assert_eq!(attributes(&at_the_bound).unwrap().len(), 1);
+        let reason = refusal(&format!("{at_the_bound}y"));
+        assert!(reason.contains("OTEL_RESOURCE_ATTRIBUTES"), "{reason}");
+        assert!(reason.contains("1024"), "{reason}");
     }
 }
