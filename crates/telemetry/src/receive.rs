@@ -362,7 +362,8 @@ fn strip_exemplars(exemplars: &mut [opentelemetry_proto::tonic::metrics::v1::Exe
     }
 }
 
-/// Strip one resource, then stamp it as the agent's, naming the box that received it.
+/// Strip one resource, remove every attribute under an operator key, then stamp the operator's
+/// attributes and the agent's provenance, naming the box that received it.
 ///
 /// **One function, because the order is load-bearing**: the stamp is itself in the reserved
 /// namespace, so a strip after it would remove the box's own provenance. A route that stamped
@@ -656,7 +657,11 @@ mod tests {
         let mut found = Vec::new();
         for line in text.lines() {
             let batch: serde_json::Value = serde_json::from_str(line).unwrap();
-            for resource in batch["resourceSpans"].as_array().into_iter().flatten() {
+            let lanes = ["resourceSpans", "resourceLogs", "resourceMetrics"];
+            for resource in lanes
+                .iter()
+                .flat_map(|lane| batch[*lane].as_array().into_iter().flatten())
+            {
                 found.push(
                     resource["resource"]["attributes"]
                         .as_array()
@@ -686,48 +691,89 @@ mod tests {
             .collect()
     }
 
+    /// One payload per route, each with one resource entry carrying `resource`.
+    fn one_resource_on_every_route(resource: Option<Resource>) -> [(&'static str, Vec<u8>); 3] {
+        use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+        use opentelemetry_proto::tonic::metrics::v1::ResourceMetrics;
+        [
+            (
+                TRACES,
+                ExportTraceServiceRequest {
+                    resource_spans: vec![ResourceSpans {
+                        resource: resource.clone(),
+                        ..Default::default()
+                    }],
+                }
+                .encode_to_vec(),
+            ),
+            (
+                LOGS,
+                ExportLogsServiceRequest {
+                    resource_logs: vec![ResourceLogs {
+                        resource: resource.clone(),
+                        ..Default::default()
+                    }],
+                }
+                .encode_to_vec(),
+            ),
+            (
+                METRICS,
+                ExportMetricsServiceRequest {
+                    resource_metrics: vec![ResourceMetrics {
+                        resource,
+                        ..Default::default()
+                    }],
+                }
+                .encode_to_vec(),
+            ),
+        ]
+    }
+
     #[tokio::test]
     async fn operator_attributes_stamp_a_relayed_agent_payload() {
-        let (port, _directory, path) = live_with(&[("conversation.id", "c-42")]).await;
-        let body = ExportTraceServiceRequest {
-            resource_spans: vec![ResourceSpans::default()],
+        for (route, body) in one_resource_on_every_route(None) {
+            let (port, _directory, path) = live_with(&[("conversation.id", "c-42")]).await;
+            assert_eq!(
+                post_to(port, route, "application/x-protobuf", body).await,
+                200
+            );
+            let found = relayed_resources(&path);
+            assert_eq!(found.len(), 1, "{route}");
+            assert_eq!(
+                values(&found[0], "conversation.id"),
+                ["c-42"],
+                "{route}: {found:?}"
+            );
+            assert_eq!(
+                values(&found[0], crate::export::SOURCE_ATTRIBUTE),
+                [crate::export::SOURCE_AGENT],
+                "{route}"
+            );
         }
-        .encode_to_vec();
-        assert_eq!(
-            post_to(port, TRACES, "application/x-protobuf", body).await,
-            200
-        );
-        let found = relayed_resources(&path);
-        assert_eq!(found.len(), 1);
-        assert_eq!(values(&found[0], "conversation.id"), ["c-42"], "{found:?}");
-        assert_eq!(
-            values(&found[0], crate::export::SOURCE_ATTRIBUTE),
-            [crate::export::SOURCE_AGENT]
-        );
     }
 
     #[tokio::test]
     async fn an_agent_cannot_forge_an_operator_attribute() {
-        let (port, _directory, path) = live_with(&[("conversation.id", "c-42")]).await;
-        let body = ExportTraceServiceRequest {
-            resource_spans: vec![ResourceSpans {
-                resource: Some(Resource {
-                    attributes: vec![
-                        text_attribute("conversation.id", "forged"),
-                        text_attribute("conversation.id", "forged-again"),
-                    ],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
+        let forged = Resource {
+            attributes: vec![
+                text_attribute("conversation.id", "forged"),
+                text_attribute("conversation.id", "forged-again"),
+            ],
+            ..Default::default()
+        };
+        for (route, body) in one_resource_on_every_route(Some(forged)) {
+            let (port, _directory, path) = live_with(&[("conversation.id", "c-42")]).await;
+            assert_eq!(
+                post_to(port, route, "application/x-protobuf", body).await,
+                200
+            );
+            let found = relayed_resources(&path);
+            assert_eq!(
+                values(&found[0], "conversation.id"),
+                ["c-42"],
+                "{route}: {found:?}"
+            );
         }
-        .encode_to_vec();
-        assert_eq!(
-            post_to(port, TRACES, "application/x-protobuf", body).await,
-            200
-        );
-        let found = relayed_resources(&path);
-        assert_eq!(values(&found[0], "conversation.id"), ["c-42"], "{found:?}");
     }
 
     #[tokio::test]
