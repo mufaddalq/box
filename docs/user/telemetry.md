@@ -143,9 +143,11 @@ $ OTEL_RESOURCE_ATTRIBUTES="tenant.id=acme,conversation.id=c-42" strands-box run
 
 Each record the box writes and each payload it relays carries these keys on its resource. The value
 uses the OpenTelemetry syntax: comma-separated `key=value` pairs, with each value percent-encoded. The
-workload does not see the variable, and an attribute the agent sends under one of your keys is replaced
-by your value. The run stops before the workload starts when an entry has no `=`, has an empty key,
-repeats a key, carries a bad percent escape, or names `service.name` or a `strands.box.` key.
+workload does not see the variable. When the agent's own resource names one of your keys, the box
+replaces that value with yours; an attribute on a span, log record, or metric stays the agent's. The
+run stops before the workload starts when the value is longer than 1024 bytes or is not UTF-8, or when
+an entry has no `=`, has an empty key, repeats a key, carries a bad percent escape, or names
+`service.name` or a `strands.box.` key.
 
 ### A decision
 
