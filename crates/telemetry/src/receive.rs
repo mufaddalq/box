@@ -66,6 +66,7 @@ pub(crate) struct Relays {
 struct Inbound {
     box_name: String,
     run_id: String,
+    operator: Arc<[(String, String)]>,
     relays: Relays,
     admitted: Semaphore,
     dropped: Arc<AtomicU64>,
@@ -112,6 +113,7 @@ impl Receiver {
         self,
         box_name: String,
         run_id: String,
+        operator: Arc<[(String, String)]>,
         relays: Relays,
         dropped: Arc<AtomicU64>,
     ) {
@@ -130,6 +132,7 @@ impl Receiver {
             .with_state(Arc::new(Inbound {
                 box_name,
                 run_id,
+                operator,
                 relays,
                 admitted: Semaphore::new(RELAY_CAPACITY),
                 dropped,
@@ -210,6 +213,7 @@ async fn accept_trace(
             &mut resource_spans.resource,
             &inbound.box_name,
             &inbound.run_id,
+            &inbound.operator,
         );
     }
 
@@ -248,6 +252,7 @@ async fn accept_logs(
             &mut resource_logs.resource,
             &inbound.box_name,
             &inbound.run_id,
+            &inbound.operator,
         );
     }
 
@@ -286,6 +291,7 @@ async fn accept_metrics(
             &mut resource_metrics.resource,
             &inbound.box_name,
             &inbound.run_id,
+            &inbound.operator,
         );
     }
 
@@ -362,9 +368,20 @@ fn strip_exemplars(exemplars: &mut [opentelemetry_proto::tonic::metrics::v1::Exe
 /// namespace, so a strip after it would remove the box's own provenance. A route that stamped
 /// without stripping let `strands.box.name` survive with the agent's own value, which one of the
 /// three forgery tests below caught.
-fn strip_and_stamp_resource(resource: &mut Option<Resource>, box_name: &str, run_id: &str) {
+fn strip_and_stamp_resource(
+    resource: &mut Option<Resource>,
+    box_name: &str,
+    run_id: &str,
+    operator: &[(String, String)],
+) {
     let resource = resource.get_or_insert_with(Default::default);
     strip(&mut resource.attributes);
+    resource
+        .attributes
+        .retain(|attribute| !operator.iter().any(|(key, _)| *key == attribute.key));
+    for (key, value) in operator {
+        resource.attributes.push(text_attribute(key, value));
+    }
     resource.attributes.push(text_attribute(
         crate::export::SOURCE_ATTRIBUTE,
         crate::export::SOURCE_AGENT,
@@ -598,6 +615,10 @@ mod tests {
     /// written before the answer, so no test has to poll for it. The one exporter takes all three
     /// of the agent's signals, which is what a target naming no `include` now receives.
     async fn live() -> (u16, tempfile::TempDir, std::path::PathBuf) {
+        live_with(&[]).await
+    }
+
+    async fn live_with(operator: &[(&str, &str)]) -> (u16, tempfile::TempDir, std::path::PathBuf) {
         use crate::config::{Target, TargetKind};
 
         let directory = tempfile::tempdir().expect("tempdir");
@@ -610,17 +631,132 @@ mod tests {
 
         let inbound = Receiver::bind().expect("bind");
         let port = inbound.port();
-        tokio::spawn(inbound.serve_forever(
-            "probe".to_string(),
-            "probe-run".to_string(),
-            Relays {
-                traces: vec![Arc::clone(&exporter)],
-                logs: vec![Arc::clone(&exporter)],
-                metrics: vec![exporter],
-            },
-            dropped,
-        ));
+        tokio::spawn(
+            inbound.serve_forever(
+                "probe".to_string(),
+                "probe-run".to_string(),
+                operator
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+                Relays {
+                    traces: vec![Arc::clone(&exporter)],
+                    logs: vec![Arc::clone(&exporter)],
+                    metrics: vec![exporter],
+                },
+                dropped,
+            ),
+        );
         (port, directory, path)
+    }
+
+    /// The resource attributes of every relayed resource in the file, as `(key, value)` pairs.
+    fn relayed_resources(path: &std::path::Path) -> Vec<Vec<(String, String)>> {
+        let text = std::fs::read_to_string(path).expect("the relayed payload");
+        let mut found = Vec::new();
+        for line in text.lines() {
+            let batch: serde_json::Value = serde_json::from_str(line).unwrap();
+            for resource in batch["resourceSpans"].as_array().into_iter().flatten() {
+                found.push(
+                    resource["resource"]["attributes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|kv| {
+                            (
+                                kv["key"].as_str().unwrap().to_string(),
+                                kv["value"]["stringValue"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+        found
+    }
+
+    fn values<'a>(resource: &'a [(String, String)], key: &str) -> Vec<&'a str> {
+        resource
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn operator_attributes_stamp_a_relayed_agent_payload() {
+        let (port, _directory, path) = live_with(&[("conversation.id", "c-42")]).await;
+        let body = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans::default()],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            post_to(port, TRACES, "application/x-protobuf", body).await,
+            200
+        );
+        let found = relayed_resources(&path);
+        assert_eq!(found.len(), 1);
+        assert_eq!(values(&found[0], "conversation.id"), ["c-42"], "{found:?}");
+        assert_eq!(
+            values(&found[0], crate::export::SOURCE_ATTRIBUTE),
+            [crate::export::SOURCE_AGENT]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_forge_an_operator_attribute() {
+        let (port, _directory, path) = live_with(&[("conversation.id", "c-42")]).await;
+        let body = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        text_attribute("conversation.id", "forged"),
+                        text_attribute("conversation.id", "forged-again"),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            post_to(port, TRACES, "application/x-protobuf", body).await,
+            200
+        );
+        let found = relayed_resources(&path);
+        assert_eq!(values(&found[0], "conversation.id"), ["c-42"], "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_attribute_the_operator_did_not_set_survives() {
+        let (port, _directory, path) = live_with(&[("conversation.id", "c-42")]).await;
+        let body = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        agents_own("service.name"),
+                        agents_own("deployment.environment"),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            post_to(port, TRACES, "application/x-protobuf", body).await,
+            200
+        );
+        let found = relayed_resources(&path);
+        assert_eq!(values(&found[0], "service.name"), ["the agent's own value"]);
+        assert_eq!(
+            values(&found[0], "deployment.environment"),
+            ["the agent's own value"]
+        );
+        assert_eq!(values(&found[0], "conversation.id"), ["c-42"]);
     }
 
     /// Post one body and answer with the status the receiver replied.

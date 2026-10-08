@@ -227,6 +227,7 @@ impl Collector {
         let receiving = tokio::spawn(inbound.serve_forever(
             box_name.clone(),
             run_id,
+            Arc::clone(&operator),
             relays,
             Arc::clone(&dropped),
         ));
