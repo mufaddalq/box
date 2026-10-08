@@ -25,7 +25,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use tokio::sync::Semaphore;
 
 use crate::error::{Result, TelemetryError};
-use crate::export::TargetExporter;
+use crate::export::{RESERVED_PREFIX, TargetExporter};
 
 /// The most a single request body may carry.
 const BODY_LIMIT: usize = 4 * 1024 * 1024;
@@ -38,12 +38,6 @@ const RESOURCE_LIMIT: usize = 1024;
 
 /// The longest one request may take, so a dribbled body cannot hold a task open.
 const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The attribute namespace the box reserves, stripped from every agent payload.
-///
-/// `strands.box.` and not all of `strands.`: the Strands Agents SDK owns its own names under
-/// `strands.`, and a wider reserve would delete them and still answer `200`.
-const RESERVED_PREFIX: &str = "strands.box.";
 
 /// The scope namespace the box reserves.
 const RESERVED_SCOPE: &str = "strands-box.";
