@@ -134,6 +134,19 @@ Each box record names its origin on its resource:
 | `strands.box.source` | `box` for a record the box wrote, and `agent` for a relayed payload |
 | `strands.box.run.id` | one identifier per `strands-box run` invocation |
 
+To add your own identity to every record, such as a tenant or a conversation, set
+`OTEL_RESOURCE_ATTRIBUTES` in the environment you start `strands-box run` from:
+
+```console
+$ OTEL_RESOURCE_ATTRIBUTES="tenant.id=acme,conversation.id=c-42" strands-box run --config box.toml
+```
+
+Each record the box writes and each payload it relays carries these keys on its resource. The value
+uses the OpenTelemetry syntax: comma-separated `key=value` pairs, with each value percent-encoded. The
+workload does not see the variable, and an attribute the agent sends under one of your keys is replaced
+by your value. The run stops before the workload starts when an entry has no `=`, has an empty key,
+repeats a key, carries a bad percent escape, or names `service.name` or a `strands.box.` key.
+
 ### A decision
 
 Each effective decision produces one log record and one span that share a trace ID and a span ID. The
