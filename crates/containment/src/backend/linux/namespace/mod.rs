@@ -60,19 +60,14 @@ impl ContainmentBackend for NamespaceBackend {
             }
         }
 
-        // The namespaces this backend creates deliver isolation unconditionally, so a request for
-        // unrestricted reach cannot be honoured -- it would be over-enforced, and the caller would
-        // never learn.
+        // The namespaces this backend creates isolate signals and IPC unconditionally, so a request
+        // for unrestricted reach there cannot be honoured -- it would be over-enforced, and the
+        // caller would never learn. Process information is the exception: `AllowAll` reuses the
+        // container's `/proc` (see `MountKind::SharedProc`).
         if config.signal_mode() != SignalMode::Isolated {
             return Err(unenforceable(
                 "SignalMode::AllowAll: a PID namespace isolates signal delivery \
                  unconditionally, so unrestricted signalling cannot be delivered",
-            ));
-        }
-        if config.process_info_mode() != ProcessInfoMode::Isolated {
-            return Err(unenforceable(
-                "ProcessInfoMode::AllowAll: the view mounts a fresh /proc, so \
-                 host process visibility cannot be delivered",
             ));
         }
         if config.ipc_mode() != IpcMode::SharedMemoryOnly {
@@ -524,10 +519,6 @@ mod tests {
 
         for (label, config) in [
             ("signal", acceptable().set_signal_mode(SignalMode::AllowAll)),
-            (
-                "process info",
-                acceptable().set_process_info_mode(ProcessInfoMode::AllowAll),
-            ),
             ("ipc", acceptable().set_ipc_mode(IpcMode::Full)),
         ] {
             let error = backend.validate_config(&config).expect_err(label);
@@ -537,6 +528,16 @@ mod tests {
                 "{label}: expected an unsupported-capability refusal, got {error:?}"
             );
         }
+    }
+
+    /// **`ProcessInfoMode::AllowAll` is lowered, not refused**: the view reuses the container's
+    /// `/proc`. Signal and IPC stay refused beside it.
+    #[test]
+    fn process_info_allow_all_is_accepted() {
+        let backend = NamespaceBackend::with_probe_result(true);
+        backend
+            .validate_config(&acceptable().set_process_info_mode(ProcessInfoMode::AllowAll))
+            .expect("AllowAll reuses the container's /proc");
     }
 
     /// `AllowAll` is the operator's `contain_egress = false` trust grant: the leaf joins the host
