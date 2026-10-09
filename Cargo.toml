@@ -32,6 +32,8 @@ exclude = [
     "test-common",
     "test-integ",
     "test-workload/verdict",
+    # A small perf benchmark. It is test code, not part of the shipped artifact
+    "crates/box-bench",
 ]
 
 # Profiles are workspace-wide (they can only be set at the workspace root). By
