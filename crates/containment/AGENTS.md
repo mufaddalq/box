@@ -208,6 +208,9 @@ by reading `src/` belongs in `src/` — the README describes the shape.
   silence** — extend it in the same change.
 - Linux selects `NamespaceBackend` on ARM64 and refuses every other architecture by name. Landlock
   was considered and rejected, because it does not enforce `Network::Blocked`.
+- `ProcessInfoMode::AllowAll` is lowered by `MountKind::SharedProc`: a recursive bind of the
+  container's `/proc`, top mount remounted `nosuid,nodev` with its locked flags kept. Do not use
+  `remount_recursive` on it: the masks beneath are locked, and remounting one fails.
 - `cfg`-gate `backend/linux/` on its module declaration, and leave `backend/macos/` ungated so its
   conformance suite runs everywhere.
 

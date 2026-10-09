@@ -34,11 +34,11 @@
 //! guards, in the file whose own header calls that spelling load-bearing. It now calls
 //! `parser_source::fields_of`, which takes the last token before the colon.
 //!
-//! # The configuration holds nine keys, and the four inputs still stand
+//! # The configuration holds ten keys, and the four inputs still stand
 //!
 //! `policy` and credentials are authority, `name` and `box_dir` select state, and `[agent] command`
-//! plus the trailing argv select the workload. `[mcp]`, `[telemetry]`, `[tool]`, and `[containment]`
-//! are keys and not additional inputs: none decides which requests are governed.
+//! plus the trailing argv select the workload. `[mcp]`, `[telemetry]`, `[tool]`, `[experimental-features]`,
+//! and `[containment]` are keys and not additional inputs: none decides which requests are governed.
 //!
 //! `[containment] private_proc = false` shows every contained process the container's process list.
 //! It grants no authority and widens no reach the policy judges: every `fs:*`, `shell:*`, and egress
