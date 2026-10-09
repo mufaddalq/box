@@ -529,11 +529,8 @@ pub(crate) const WORKLOAD_PERMITTED: &[PermittedSyscall] = &[
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) const ARCH_PERMITTED: &[ArchPermittedSyscall] = &[];
 
-// x86-64 keeps the legacy spellings that the generic table of ARM64 removed, and glibc, the dynamic
-// loader, and CPython still call some of them. A permit table answers an unlisted call with `EPERM`,
-// and a caller reads that as a real failure. So each spelling is permitted only when its twin is a
-// shared permit, and no spelling reaches more than its twin does.
-/// The permits only this architecture needs.
+/// The permits only this architecture needs, for the reason that
+/// `docs/design/decisions.md#the-linux-boundary-is-namespaces-not-landlock` states.
 #[cfg(target_arch = "x86_64")]
 pub(crate) const ARCH_PERMITTED: &[ArchPermittedSyscall] = &[
     ArchPermittedSyscall {
