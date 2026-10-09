@@ -35,7 +35,7 @@ async fn spawn_registered(
         config_path: boundary.containment_config(),
         config_file: boundary.containment_config_file(),
         config_sha256: boundary.containment_digest(),
-        target_environment: boundary.target_environment(),
+        target_environment_file: boundary.target_environment_file(),
         executable: boundary.executable(),
         arguments: boundary.arguments(),
         argument_zero: boundary.argument_zero(),

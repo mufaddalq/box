@@ -864,7 +864,7 @@ bounding and ambient, set `no_new_privs`, then install seccomp **last**.
 
 ## The trampoline
 
-`strands-box-contain-trampoline --config <file> --config-sha256 <digest> --target-env-json <json> --
+`strands-box-contain-trampoline --config <file> --config-sha256 <digest> [--target-env-fd <fd>] --
 <command> [args...]`. Read and unlink the config, verify the digest, apply once while
 single-threaded, then decode the target environment and exec with a cleared environment. Reject an
 empty name, `=` or NUL in a name, and NUL in a value. `--relay-control-fd` is Linux-only.
