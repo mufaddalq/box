@@ -743,7 +743,9 @@ Each looks like a simplification and is not. If one is genuinely wanted, record 
   - **`cmdline`, `stat`, `status`, `mountinfo`, `net/*`, and `task/*/{stat,status,cmdline}` stay
     readable.** Only the address space is protected, never the process topology. Under
     `[containment] private_proc = false` they are readable by every leaf too, because the leaves
-    share the container's `/proc`.
+    share the container's `/proc`, and a leaf can **write** a same-uid process's `oom_score_adj`
+    (the box's included): dumpable guards the address space, not that file. Accepted as a
+    residual, pinned by `shared_proc_linux.rs`.
   - **It stops the *read*, not the *copy*.** Un-wiped plaintext copies on the request path are
     fixed in `credentials` and `egress-gateway`.
   - **Applied only for the spelling that holds a secret.** The other verbs are CLI clients, and

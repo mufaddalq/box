@@ -459,9 +459,13 @@ The record omits `url.full` and `process.command_line`.
 Set `private_proc = false` only on a Linux host that masks `/proc`, such as a Kata pod or a
 non-privileged container, where `box run` otherwise refuses with "this host masks parts of /proc".
 Every contained process (the agent, each tool, and each stdio MCP server) can then list the
-container's processes and read each one's command line, `stat`, and `status`. It still cannot signal,
-trace, or inspect them. **A secret passed on any process's command line in that container becomes
-readable to the workload.** Each leaf that shares records `proc:shared`. macOS refuses the key.
+container's processes and read each one's command line, `stat`, `status`, mounts, limits, and
+cgroup, and its network namespace's socket tables. It can raise the OOM score of a process running
+as the same user, the box's own included. It still cannot signal or trace them, or read their
+memory, environment, or open files. `/proc` keeps the container's process numbers, so a program
+finds itself at `/proc/self` but not at `/proc/<its pid>`. **A secret passed on any process's
+command line in that container becomes readable to the workload.** Each leaf that shares records
+`proc:shared`. macOS refuses the key.
 
 ## Errors
 

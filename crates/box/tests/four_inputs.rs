@@ -42,7 +42,8 @@
 //!
 //! `[containment] private_proc = false` shows every contained process the container's process list.
 //! It grants no authority and widens no reach the policy judges: every `fs:*`, `shell:*`, and egress
-//! decision is unchanged, and the processes it shows cannot be signalled, traced, or inspected.
+//! decision is unchanged. The processes it shows cannot be signalled, traced, or have their memory,
+//! environment, or descriptors read; a same-uid one can have its OOM score raised.
 //!
 //! `[agent] env` names variables the box adds to the composed environment. It cannot name a
 //! reserved variable, so it cannot reach proxy routing, CA trust, or the fixed identity, and it
@@ -215,7 +216,7 @@ fn the_config_record_carries_only_the_four_inputs() {
          is stated in the startup disclosure the box prints for every grant they name. \
          `containment` is not a fifth input either: it grants no authority and widens no reach \
          the policy judges. `private_proc = false` shows the workload the container's process \
-         list and nothing more; every `fs:*`, `shell:*`, and egress decision is unchanged. A \
+         list and lets it raise a same-uid process's OOM score; every `fs:*`, `shell:*`, and egress decision is unchanged. A \
          TENTH field changes the input contract and must update this guard."
     );
 }
