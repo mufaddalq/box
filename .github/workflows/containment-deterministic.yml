@@ -158,7 +158,7 @@ jobs:
       # The x86_64 permit filter's kernel proof. The test compiles to nothing on arm64, and it skips
       # when the host cannot build a view, so a skip here fails the step instead of reading green.
       - name: Prove the x86_64 syscall surface (linux x86_64 only)
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu') && runner.arch == 'X64'
         shell: bash
         run: |
           cargo test -p strands-box-containment --locked --all-features \
