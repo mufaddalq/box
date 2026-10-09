@@ -577,6 +577,16 @@ impl MountView {
                     None,
                 )
                 .map_err(|e| {
+                    // A masked host refuses every private procfs. Say so, because the bare `EPERM`
+                    // reads as a permissions bug the operator can fix, and it is not.
+                    if fstype == "proc" && e.raw_os_error() == Some(libc::EPERM) {
+                        let points = std::fs::read_to_string("/proc/self/mounts")
+                            .map(|table| masked_proc_points(&table))
+                            .unwrap_or_default();
+                        if !points.is_empty() {
+                            return refusal(masked_proc_reason(&points, &e));
+                        }
+                    }
                     refusal(format!(
                         "mounting a fresh {fstype} at '{}': {e}",
                         target.display()
@@ -925,6 +935,37 @@ fn remount_writable_noexec(target: &Path) -> Result<(), ContainmentError> {
     const FLAGS: libc::c_ulong =
         libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOEXEC | libc::MS_NOSUID | libc::MS_NODEV;
     remount_recursive(target, FLAGS, "no-exec")
+}
+
+/// What the box matches to add its own hint. Changing it breaks that match: grep the workspace.
+const MASKED_PROC_MARKER: &str = "masks parts of /proc";
+
+/// The mount points strictly under `/proc` in a mount table: the container runtime's masks.
+fn masked_proc_points(table: &str) -> Vec<PathBuf> {
+    table
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|raw| PathBuf::from(unescape_mount_field(raw)))
+        .filter(|point| point != Path::new("/proc") && point.starts_with("/proc"))
+        .collect()
+}
+
+/// The refusal for a fresh procfs the kernel refused on a host that masks `/proc`.
+fn masked_proc_reason(points: &[PathBuf], error: &std::io::Error) -> String {
+    let mut named: Vec<String> = points
+        .iter()
+        .take(2)
+        .map(|point| point.display().to_string())
+        .collect();
+    if points.len() > 2 {
+        named.push("…".to_string());
+    }
+    format!(
+        "this host {MASKED_PROC_MARKER} ({}), so the kernel refuses a private procfs in a user \
+         namespace; a caller that accepts showing the host's process list can request \
+         ProcessInfoMode::AllowAll: {error}",
+        named.join(", ")
+    )
 }
 
 /// The flags a bind remount must carry over from the mount it remounts, because the kernel may have
@@ -1581,6 +1622,44 @@ fn refusal(reason: String) -> ContainmentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RUNC_MASKED: &str = "\
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /proc/acpi tmpfs ro,relatime 0 0
+tmpfs /dev/null tmpfs rw 0 0
+tmpfs /proc/kcore tmpfs rw,nosuid 0 0
+proc /proc/sys proc ro,nosuid,nodev,noexec,relatime 0 0
+";
+
+    #[test]
+    fn a_runtime_masked_table_is_detected() {
+        assert_eq!(
+            masked_proc_points(RUNC_MASKED),
+            [
+                PathBuf::from("/proc/acpi"),
+                PathBuf::from("/proc/kcore"),
+                PathBuf::from("/proc/sys")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_clean_table_and_a_bare_proc_are_not_masked() {
+        assert!(masked_proc_points("proc /proc proc rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n").is_empty());
+        // `/procfoo` is not under `/proc`.
+        assert!(masked_proc_points("tmpfs /procfoo tmpfs rw 0 0\n").is_empty());
+    }
+
+    #[test]
+    fn the_masked_reason_carries_the_marker_two_points_and_the_os_error() {
+        let points = masked_proc_points(RUNC_MASKED);
+        let error = std::io::Error::from_raw_os_error(libc::EPERM);
+        let reason = masked_proc_reason(&points, &error);
+        assert!(reason.contains(MASKED_PROC_MARKER), "{reason}");
+        assert!(reason.contains("/proc/acpi, /proc/kcore, …"), "{reason}");
+        assert!(reason.contains("ProcessInfoMode::AllowAll"), "{reason}");
+        assert!(reason.ends_with(&error.to_string()), "{reason}");
+    }
 
     /// **`AllowAll` plans the container's `/proc`, bound with its masks**; `Isolated` keeps the
     /// fresh procfs that `the_scaffold_is_always_planned_and_the_root_is_first` pins.
