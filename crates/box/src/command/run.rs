@@ -206,7 +206,14 @@ async fn hosted(
         &site,
     )?;
     eprintln!("{}", boundary.disclosure());
+    let shares_proc = boundary.shares_proc();
+    let recorder = Arc::clone(hosted.recorder());
     let contained = Contained::spawn(boundary, &locked.root, hosted).await?;
+    if shares_proc {
+        recorder.record(crate::run::telemetry::EffectiveDecision::shared_proc(
+            "agent",
+        ));
+    }
     contained.wait().await
 }
 
