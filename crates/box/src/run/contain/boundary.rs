@@ -209,8 +209,12 @@ pub(crate) struct Boundary {
     containment_config_file: std::fs::File,
     containment_digest: String,
 
-    /// The process's environment, serialized for the trampoline.
+    /// The process's environment, serialized for the trampoline. Kept as text only for tests; the
+    /// trampoline reads [`Self::target_environment_file`].
+    #[cfg(test)]
     target_environment: String,
+    /// The same bytes as an opened file: the trampoline reads them through a descriptor, never argv.
+    target_environment_file: std::fs::File,
 
     /// Where the process starts, and what its `PWD` says.
     working_directory: PathBuf,
@@ -616,6 +620,13 @@ impl Boundary {
         })?;
         let target_environment = serde_json::to_string(&composed)
             .map_err(|source| TrampolineError::Environment { source })?;
+        // The environment reaches the trampoline as an opened file, never as argv: argv stays
+        // readable in `/proc/<pid>/cmdline` for the launcher's whole life.
+        let target_environment_file = layout.write_private_opened_file(
+            &layout.containment_config("active-environment"),
+            &target_environment,
+            0o600,
+        )?;
 
         // Every exec identity inside a writable grant is disclosed, the command and each interpreter
         // hop alike.
@@ -688,7 +699,9 @@ impl Boundary {
             containment_config,
             containment_config_file,
             containment_digest,
+            #[cfg(test)]
             target_environment,
+            target_environment_file,
             disclosure,
             #[cfg(target_os = "linux")]
             served_ports: served_ports.clone(),
@@ -736,8 +749,13 @@ impl Boundary {
         &self.containment_digest
     }
 
+    #[cfg(test)]
     pub(crate) fn target_environment(&self) -> &str {
         &self.target_environment
+    }
+
+    pub(crate) fn target_environment_file(&self) -> &std::fs::File {
+        &self.target_environment_file
     }
 
     /// Where the process starts, and what its `PWD` says.
@@ -1559,6 +1577,57 @@ mod tests {
 
     fn environment_of(boundary: &Boundary) -> BTreeMap<String, String> {
         serde_json::from_str(boundary.target_environment()).expect("the environment is JSON")
+    }
+
+    /// What the trampoline will read from the boundary's environment descriptor.
+    fn environment_descriptor_text(boundary: &Boundary) -> String {
+        let mut file = boundary.target_environment_file();
+        let mut text = String::new();
+        file.seek(std::io::SeekFrom::Start(0))
+            .expect("the environment descriptor seeks");
+        file.read_to_string(&mut text)
+            .expect("the environment descriptor reads");
+        text
+    }
+
+    /// **The descriptor holds exactly the composed environment**, whole, for a large value too.
+    #[test]
+    fn the_environment_descriptor_holds_the_composed_environment() {
+        let fixture = Fixture::new();
+        let big = "x".repeat(200 * 1024);
+        let mut spec = fixture.spec();
+        spec.env.insert("BIG".to_string(), big.clone());
+        let boundary = fixture.translate(&spec, "[agent]", &[]);
+
+        let text = environment_descriptor_text(&boundary);
+
+        assert_eq!(text, boundary.target_environment());
+        assert!(text.contains(&big), "the large value arrives whole");
+    }
+
+    /// **Two leaves translated back to back keep their own environments**, though both write the
+    /// same path: each holds its own opened file.
+    #[test]
+    fn two_boundaries_keep_their_own_environment_descriptors() {
+        let fixture = Fixture::new();
+        let mut first_spec = fixture.spec();
+        first_spec
+            .env
+            .insert("WHO".to_string(), "first".to_string());
+        let mut second_spec = fixture.spec();
+        second_spec
+            .env
+            .insert("WHO".to_string(), "second".to_string());
+        let first = fixture.translate(&first_spec, "[agent]", &[]);
+        let second = fixture.translate(&second_spec, "[agent]", &[]);
+
+        for (boundary, who) in [(&first, "first"), (&second, "second")] {
+            let text = environment_descriptor_text(boundary);
+            assert!(
+                text.contains(&format!("\"WHO\":\"{who}\"")),
+                "{who}: {text}"
+            );
+        }
     }
 
     /// **A spawn acts on the reach judged when the run started.** The directory holding an
