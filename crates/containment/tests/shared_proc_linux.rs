@@ -126,6 +126,13 @@ fn spawn_contained(work_dir: &Path, script: &str) -> (Child, tempfile::NamedTemp
     (child, config)
 }
 
+fn make_fifo(path: &Path) -> std::path::PathBuf {
+    let made = std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("no NUL");
+    // SAFETY: a NUL-terminated path and a mode.
+    assert_eq!(unsafe { libc::mkfifo(made.as_ptr(), 0o600) }, 0, "mkfifo");
+    path.to_path_buf()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -201,10 +208,7 @@ fn a_shared_proc_workload_reads_an_outside_cmdline_residual() {
 fn the_launcher_outside_the_pid_namespace_cannot_be_reached() {
     needs_a_masked_host!();
     let work_dir = tempfile::tempdir().expect("work directory");
-    let fifo = work_dir.path().join("launcher.pid");
-    let made = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("no NUL");
-    // SAFETY: a NUL-terminated path and a mode.
-    assert_eq!(unsafe { libc::mkfifo(made.as_ptr(), 0o600) }, 0, "mkfifo");
+    let fifo = make_fifo(&work_dir.path().join("launcher.pid"));
     let script = format!(
         "read pid < {}\n{}",
         fifo.display(),
@@ -223,20 +227,33 @@ fn the_launcher_outside_the_pid_namespace_cannot_be_reached() {
 }
 
 /// **A second contained workload is out of reach**: its launcher lives in a sibling user namespace.
+/// The probe targets the first *workload*, not its launcher (which the capability check protects
+/// regardless): the first shell reads its own PID in the shared `/proc` and hands it over a FIFO.
 #[test]
 fn a_second_contained_workload_cannot_be_reached() {
     needs_a_masked_host!();
     let first_dir = tempfile::tempdir().expect("work directory");
-    let hold = first_dir.path().join("hold");
-    let made = std::ffi::CString::new(hold.to_str().expect("utf-8 path")).expect("no NUL");
-    // SAFETY: a NUL-terminated path and a mode.
-    assert_eq!(unsafe { libc::mkfifo(made.as_ptr(), 0o600) }, 0, "mkfifo");
-    // The first workload blocks reading the FIFO until the probe is done.
-    let (mut first, _first_config) =
-        spawn_contained(first_dir.path(), &format!("read x < {}", hold.display()));
+    let pid_fifo = make_fifo(&first_dir.path().join("pid"));
+    let hold = make_fifo(&first_dir.path().join("hold"));
+    // The first workload publishes its PID, then blocks reading `hold` until the probe is done.
+    let (mut first, _first_config) = spawn_contained(
+        first_dir.path(),
+        &format!(
+            "read p _ < /proc/self/stat\necho $p > {}\nread x < {}",
+            pid_fifo.display(),
+            hold.display()
+        ),
+    );
+    let first_workload = std::fs::read_to_string(&pid_fifo).expect("the first workload's pid");
+    let first_workload = first_workload.trim();
+    assert_ne!(
+        first_workload,
+        first.id().to_string(),
+        "the probe must target the workload, not its launcher"
+    );
 
     let second_dir = tempfile::tempdir().expect("work directory");
-    let out = run_contained(second_dir.path(), &probe_script(&first.id().to_string()));
+    let out = run_contained(second_dir.path(), &probe_script(first_workload));
 
     std::fs::OpenOptions::new()
         .write(true)
@@ -246,6 +263,44 @@ fn a_second_contained_workload_cannot_be_reached() {
     let _ = first.wait();
     let text = stdout(&out);
     assert!(text.contains("DONE") && !text.contains("LEAK"), "{out:?}");
+}
+
+/// **Residual pin**: an outside process's `mountinfo` and `net/tcp` are readable,
+/// and an outside same-uid process's `oom_score_adj` is writable (the value is written back
+/// unchanged). If this fails, a kernel or design change closed the residual: update the spec's
+/// residual section and the docs, do not reopen it.
+#[test]
+fn a_shared_proc_workload_reads_mounts_and_sockets_and_writes_oom_score_residual() {
+    needs_a_masked_host!();
+    let work_dir = tempfile::tempdir().expect("work directory");
+    let outside = std::process::id();
+    let out = run_contained(
+        work_dir.path(),
+        &format!(
+            "(exec 3< /proc/{outside}/mountinfo) && echo MOUNTS\n\
+             (exec 3< /proc/{outside}/net/tcp) && echo SOCKETS\n\
+             read v < /proc/{outside}/oom_score_adj && echo $v > /proc/{outside}/oom_score_adj \
+             && echo OOM"
+        ),
+    );
+    let text = stdout(&out);
+    for residual in ["MOUNTS", "SOCKETS", "OOM"] {
+        assert!(text.contains(residual), "{residual}: {out:?}");
+    }
+}
+
+/// **Residual pin**: `/proc` belongs to the container's PID namespace, so `/proc/<getpid()>` is not
+/// the workload; only `/proc/self` is. A program that builds `/proc/<its pid>` paths reads the
+/// wrong process or nothing.
+#[test]
+fn a_shared_proc_workload_finds_itself_only_at_proc_self_residual() {
+    needs_a_masked_host!();
+    let work_dir = tempfile::tempdir().expect("work directory");
+    let out = run_contained(
+        work_dir.path(),
+        "read p _ < /proc/self/stat\n[ \"$p\" != \"$$\" ] && echo MISMATCH",
+    );
+    assert!(stdout(&out).contains("MISMATCH"), "{out:?}");
 }
 
 /// **Positive control for `PROBE`**: pointed at the workload itself, it must report what it can
