@@ -11,9 +11,7 @@ use crate::ContainmentConfig;
 use crate::backend::{ContainmentBackend, SupportInfo};
 use crate::error::ContainmentError;
 use crate::floors::require_bounded_grant;
-use crate::model::{
-    BackendOverride, IpcMode, Network, Operation, ProcessInfoMode, Scope, SignalMode,
-};
+use crate::model::{BackendOverride, IpcMode, Network, Operation, Scope, SignalMode};
 use crate::platform::Platform;
 
 /// This backend's mechanism name, as reported by `SupportInfo` and carried in
@@ -536,7 +534,9 @@ mod tests {
     fn process_info_allow_all_is_accepted() {
         let backend = NamespaceBackend::with_probe_result(true);
         backend
-            .validate_config(&acceptable().set_process_info_mode(ProcessInfoMode::AllowAll))
+            .validate_config(
+                &acceptable().set_process_info_mode(crate::model::ProcessInfoMode::AllowAll),
+            )
             .expect("AllowAll reuses the container's /proc");
     }
 
