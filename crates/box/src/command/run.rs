@@ -328,6 +328,7 @@ mod tests {
             mcp: Vec::new(),
             contained_mcp: BTreeMap::new(),
             telemetry: BTreeMap::new(),
+            containment: Default::default(),
         }
     }
 

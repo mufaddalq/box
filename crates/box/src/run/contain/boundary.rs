@@ -216,6 +216,9 @@ pub(crate) struct Boundary {
     /// The same bytes as an opened file: the trampoline reads them through a descriptor, never argv.
     target_environment_file: std::fs::File,
 
+    /// Whether this leaf shares the container's `/proc` (`[containment] private_proc = false`).
+    shares_proc: bool,
+
     /// Where the process starts, and what its `PWD` says.
     working_directory: PathBuf,
 
@@ -390,7 +393,9 @@ impl Boundary {
                 listen: Vec::new(),
             },
         };
-        let mut containment = ContainmentConfig::new().set_network(network)?;
+        let mut containment = ContainmentConfig::new()
+            .set_network(network)?
+            .set_process_info_mode(stored.containment.process_info_mode());
         // A leaf may run a bundled JS/Node runtime that touches host services at
         // startup — `getifaddrs` (net.* sysctls + a routing socket) and `getpwuid` (identity
         // resolution) — dying with no diagnostic without them. Grant those to a leaf.
@@ -702,6 +707,7 @@ impl Boundary {
             #[cfg(test)]
             target_environment,
             target_environment_file,
+            shares_proc: !stored.containment.private_proc,
             disclosure,
             #[cfg(target_os = "linux")]
             served_ports: served_ports.clone(),
@@ -756,6 +762,11 @@ impl Boundary {
 
     pub(crate) fn target_environment_file(&self) -> &std::fs::File {
         &self.target_environment_file
+    }
+
+    /// Whether this leaf shares the container's `/proc` (`[containment] private_proc = false`).
+    pub(crate) fn shares_proc(&self) -> bool {
+        self.shares_proc
     }
 
     /// Where the process starts, and what its `PWD` says.
@@ -1357,6 +1368,7 @@ mod tests {
                 mcp,
                 contained_mcp: Default::default(),
                 telemetry: Default::default(),
+                containment: Default::default(),
             };
             let attachment = Attachment {
                 proxy_port: 41080,
@@ -1588,6 +1600,35 @@ mod tests {
         file.read_to_string(&mut text)
             .expect("the environment descriptor reads");
         text
+    }
+
+    /// **The key reaches every leaf**: the agent, a tool, and a stdio MCP server each carry
+    /// `AllowAll` when the box shares its `/proc`, and `Isolated` when it does not.
+    #[test]
+    fn private_proc_false_reaches_the_agent_tools_and_mcp_servers() {
+        for private_proc in [true, false] {
+            let mut fixture = Fixture::new();
+            fixture.record.containment =
+                crate::record::config::isolation::ContainmentSpec { private_proc };
+            let expected = if private_proc {
+                containment::ProcessInfoMode::Isolated
+            } else {
+                containment::ProcessInfoMode::AllowAll
+            };
+            let spec = fixture.spec();
+            for (table, reach) in [
+                ("[agent]", RuntimeReach::Agent),
+                ("[tool.x]", RuntimeReach::Leaf),
+                ("[mcp.y]", RuntimeReach::Leaf),
+            ] {
+                let boundary = fixture.translate_with_reach(&spec, table, reach);
+                let config =
+                    containment::ContainmentConfig::from_json(&boundary.containment_config_text())
+                        .expect("the config parses");
+                assert_eq!(config.process_info_mode(), expected, "{table}");
+                assert_eq!(boundary.shares_proc(), !private_proc, "{table}");
+            }
+        }
     }
 
     /// **The descriptor holds exactly the composed environment**, whole, for a large value too.
