@@ -54,10 +54,10 @@ expression above once it has a green baseline.
 
 The AppArmor question is settled, and it was **not** the blocker. The workflow
 clears `kernel.apparmor_restrict_unprivileged_userns` and probes it with
-`unshare`, and that demonstrably works — the x86_64 run logged `before: 1` →
-`after: 0` and `unshare(CLONE_NEWUSER): OK` before failing on architecture. The
-step stays because Ubuntu 24.04 restricts unprivileged user namespaces on arm64
-too, and the cage needs that primitive on any Linux.
+`unshare`, and that demonstrably works — the run logged `before: 1` → `after: 0`
+and `unshare(CLONE_NEWUSER): OK`. The step stays because Ubuntu 24.04 restricts
+unprivileged user namespaces on both architectures, and the cage needs that
+primitive on any Linux.
 
 ### A red leg does not notify anyone
 
