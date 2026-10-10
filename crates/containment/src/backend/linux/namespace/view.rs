@@ -3659,12 +3659,21 @@ mod tests {
 
         let entries = planned(&config);
 
+        // Bound at its identity. Where the spelling is itself a link (`/lib64 -> usr/lib64` on
+        // merged-`/usr` x86_64), the spelling is that link in the view, not a second bind.
+        let identity = loader.canonicalize().expect("canonical loader directory");
         let bound = entries
             .iter()
-            .find(|entry| entry.target == loader)
-            .expect("the loader directory is bound under its own spelling");
+            .find(|entry| entry.target == identity && entry.kind == MountKind::Bind)
+            .expect("the loader directory is bound at its identity");
         assert!(bound.executable && !bound.writable, "{bound:?}");
         assert_eq!(bound.origin, MountOrigin::Grant);
+        if is_link_node(loader) {
+            assert!(
+                matches!(entry_for(&entries, loader).kind, MountKind::Symlink { .. }),
+                "a linked loader directory is its link in the view: {entries:#?}"
+            );
+        }
         let plain = entries
             .iter()
             .find(|entry| entry.target == other)
