@@ -376,7 +376,7 @@ A file destination inside the box directory and outside `private/` is refused: `
 the box directory <path> but outside its private tree, where a process could truncate it; name a
 destination under `private/`, or outside the box, or declare no target and take the default`. An
 empty `include` is refused with `the target names no signal, so nothing would reach it; write one or
-more of: deny, permit, trace, logs, metrics`, and a repeated word with `the target names deny twice`.
+more of: deny, permit, trace, logs, metrics, kernel`, and a repeated word with `the target names deny twice`.
 
 ### `logs` and `metrics` are unconditional
 

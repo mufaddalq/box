@@ -98,7 +98,9 @@ The box records the first refusal of a kind at once and counts repeats for ten s
 can stand for many calls: `strands.box.containment.suppressed` says how many more. A box tracks at
 most 256 kinds; past that, one `refusals_unobserved` control record says so. When the host cannot
 pass the box the kernel's notifications, the refusals still happen and one `refusals_unobserved`
-record names the reason.
+record names the reason. `refusals_unobserved` is a control record, so it reaches a target through
+`trace`, not `kernel`: a target that names `kernel` and not `trace` does not learn that refusals went
+unobserved.
 
 An empty list is refused, and so is a repeated word.
 

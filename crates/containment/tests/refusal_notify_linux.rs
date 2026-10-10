@@ -80,8 +80,11 @@ fn launch(probe_args: &[&str]) -> Launch {
     }
 }
 
+/// The refusals the box side saw: syscall, decoded arguments, and pid.
+type Seen = Vec<(String, Option<String>, u32)>;
+
 /// Act as the box: take the handoff and answer every refusal until the launch ends.
-fn serve(box_side: &UnixStream) -> (Option<i32>, Vec<(String, Option<String>, u32)>) {
+fn serve(box_side: &UnixStream) -> (Option<i32>, Seen) {
     match receive_handoff(box_side).expect("handoff") {
         Handoff::Observed(listener) => {
             let mut seen = Vec::new();
@@ -237,12 +240,7 @@ const RET: u16 = 0x06;
 fn run_under(
     outer: Vec<libc::sock_filter>,
     probe_args: &[&str],
-) -> (
-    Option<i32>,
-    Vec<(String, Option<String>, u32)>,
-    String,
-    String,
-) {
+) -> (Option<i32>, Seen, String, String) {
     let mut l = launch(probe_args);
     under_outer_filter(&mut l.command, outer);
     let child = l
@@ -357,4 +355,43 @@ fn host_can_build_a_view() -> bool {
     // SAFETY: wait for this process's child.
     unsafe { libc::waitpid(child, &mut status, 0) };
     libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
+/// **Late failure fails closed**: once the observed filter is installed nothing can be stacked over
+/// it, so when PID 1 cannot send the copied listener to the box (here EACCES on `sendmsg`, the
+/// first send of a launch with no network), the apply is refused and the workload never runs.
+#[test]
+fn a_listener_that_cannot_reach_the_box_refuses_the_apply() {
+    if !host_can_build_a_view() {
+        println!("skipping: no namespace view on this host");
+        return;
+    }
+    let refuse_send = vec![
+        statement(LOAD_NR, 0),
+        jump(JEQ, libc::SYS_sendmsg as u32, 0, 1),
+        statement(RET, libc::SECCOMP_RET_ERRNO | libc::EACCES as u32),
+        statement(RET, libc::SECCOMP_RET_ALLOW),
+    ];
+    let mut l = launch(&["--refused-calls"]);
+    under_outer_filter(&mut l.command, refuse_send);
+    let child = l
+        .command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    drop(l.child_side.take());
+    assert!(matches!(
+        receive_handoff(&l.box_side).expect("handoff"),
+        Handoff::Absent
+    ));
+    let output = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("rc="), "the workload ran: {stdout}");
+    assert!(
+        stderr.contains("could not hand the seccomp listener to the box"),
+        "{stderr}"
+    );
 }

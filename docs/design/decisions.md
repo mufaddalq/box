@@ -1760,9 +1760,10 @@ replaces the default instead of adding to it. The file grows without bound and n
 <a id="a-target-names-a-set-of-signals"></a>
 ### A target names a set of signals, and an absent list takes every signal
 
-`[telemetry.<label>] include` takes five words: `deny` and `permit` name the two effective verdicts,
-`trace` names the agent's relayed spans and the box's own control-plane records, and `logs` and
-`metrics` name the agent's relayed log and metric records. A target names a set, with no ordering, and
+`[telemetry.<label>] include` takes six words: `deny` and `permit` name the two effective verdicts,
+`trace` names the agent's relayed spans and the box's own control-plane records, `logs` and
+`metrics` name the agent's relayed log and metric records, and `kernel` names the box's records of
+calls the kernel refused beneath policy. A target names a set, with no ordering, and
 no signal contains another. A target that names no `include` receives every signal, which
 `an_absent_include_takes_every_signal` pins. An empty list, a repeated word, and a misspelled word are
 each refused before the box exists. The box relays a harness signal and never produces one, so the

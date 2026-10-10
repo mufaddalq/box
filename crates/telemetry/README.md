@@ -59,7 +59,7 @@ A target names a **set**. No signal contains another, and there is no ordering.
 | `control_plane` | one change to the authority this box holds |
 | `kernel_refused` | one call the kernel refused beneath policy (Linux seccomp), queued with `Collector::refusal` |
 
-**A target naming none receives every one of the six.** An empty set is refused.
+**A target naming none receives every one of the seven.** An empty set is refused.
 
 These seven are this crate's own vocabulary and the spelling a record carries. They are not what an
 operator writes: `box.toml` takes `include`, whose words are `deny`, `permit`, `trace`, `kernel`,
