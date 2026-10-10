@@ -4,11 +4,14 @@
 //! key at once, counts repeats, and caps how many keys it tracks. Every notification is still
 //! answered: the limit drops records, never responses.
 
-// Wired into the launches in the next commit.
-#![cfg_attr(not(test), allow(dead_code))]
+// Only the Linux watcher feeds the recorder today; macOS joins with Seatbelt violation reports.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::run::telemetry::Collector;
 
 /// What one refusal is grouped under.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -114,6 +117,286 @@ impl RefusalLimiter {
     }
 }
 
+/// One refusal the watcher read, with its caller's details.
+#[derive(Debug, Clone)]
+pub(crate) struct Observed {
+    pub(crate) pid: u32,
+    pub(crate) executable: String,
+    pub(crate) argv: Vec<String>,
+    pub(crate) syscall: String,
+    pub(crate) arguments: Option<String>,
+}
+
+/// Test-only view of what reached the collector.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct Emitted {
+    pub(crate) syscall: String,
+    pub(crate) suppressed: u64,
+}
+
+/// The box's one sink for kernel refusals, shared by every launch in it.
+pub(crate) struct RefusalRecorder {
+    collector: Option<Arc<Collector>>,
+    limiter: Mutex<RefusalLimiter>,
+    #[cfg(test)]
+    recorded: Mutex<Vec<Emitted>>,
+}
+
+impl RefusalRecorder {
+    pub(crate) fn over(collector: Arc<Collector>) -> Arc<Self> {
+        Arc::new(Self {
+            collector: Some(collector),
+            limiter: Mutex::new(RefusalLimiter::new(
+                RefusalLimiter::WINDOW,
+                RefusalLimiter::CAP,
+            )),
+            #[cfg(test)]
+            recorded: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discarding() -> Arc<Self> {
+        Arc::new(Self {
+            collector: None,
+            limiter: Mutex::new(RefusalLimiter::new(
+                RefusalLimiter::WINDOW,
+                RefusalLimiter::CAP,
+            )),
+            recorded: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded(&self) -> Vec<Emitted> {
+        self.recorded.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// Count one refusal, and emit it if the limiter says so.
+    pub(crate) fn observe(&self, refusal: Observed) {
+        let key = RefusalKey {
+            executable: refusal.executable.clone(),
+            syscall: refusal.syscall.clone(),
+            arguments: refusal.arguments.clone(),
+        };
+        let admitted = match self.limiter.lock() {
+            Ok(mut limiter) => limiter.admit(&key, std::time::Instant::now()),
+            Err(_) => return,
+        };
+        match admitted {
+            Admit::Record { suppressed } => self.emit(&refusal, suppressed),
+            Admit::Overflow => self.control(telemetry::ControlRecord::refused(
+                telemetry::ControlOperation::RefusalsUnobserved,
+                "box",
+                "rate_cap",
+            )),
+            Admit::Nothing => {}
+        }
+    }
+
+    /// One launch's install fell back, so its refusals are not observed.
+    pub(crate) fn unobserved(&self, launch: &str, errno: i32) {
+        self.control(telemetry::ControlRecord::refused(
+            telemetry::ControlOperation::RefusalsUnobserved,
+            launch,
+            &errno_name(errno),
+        ));
+    }
+
+    /// Emit every pending count and the overflow tally. Called on drop, and safe to call twice.
+    pub(crate) fn flush(&self) {
+        let drained = match self.limiter.lock() {
+            Ok(mut limiter) => limiter.drain(),
+            Err(_) => return,
+        };
+        for (key, count) in drained.pending {
+            let refusal = Observed {
+                pid: 0,
+                executable: key.executable,
+                argv: Vec::new(),
+                syscall: key.syscall,
+                arguments: key.arguments,
+            };
+            self.emit(&refusal, count - 1);
+        }
+        if drained.overflow > 0 {
+            self.control(
+                telemetry::ControlRecord::refused(
+                    telemetry::ControlOperation::RefusalsUnobserved,
+                    "box",
+                    "rate_cap",
+                )
+                .detailed(&format!("{} refusals", drained.overflow)),
+            );
+        }
+    }
+
+    fn emit(&self, refusal: &Observed, suppressed: u64) {
+        #[cfg(test)]
+        if let Ok(mut recorded) = self.recorded.lock() {
+            recorded.push(Emitted {
+                syscall: refusal.syscall.clone(),
+                suppressed,
+            });
+        }
+        if let Some(collector) = &self.collector {
+            let args: Vec<String> = refusal.argv.iter().skip(1).cloned().collect();
+            let process = telemetry::Subject::process(&refusal.executable, &args, &[], "");
+            collector.refusal(
+                telemetry::RefusalRecord::seccomp(
+                    &refusal.syscall,
+                    refusal.arguments.as_deref(),
+                    refusal.pid,
+                    process,
+                )
+                .suppressed(suppressed),
+            );
+        }
+    }
+
+    fn control(&self, record: telemetry::ControlRecord) {
+        if let Some(collector) = &self.collector {
+            collector.control(record);
+        }
+    }
+}
+
+impl Drop for RefusalRecorder {
+    /// The last launch is gone, so what the limiter still counts is emitted before the collector
+    /// drains.
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// The errno name for a fallback's control record. Mirrors containment's own list.
+fn errno_name(errno: i32) -> String {
+    match errno {
+        libc::EBUSY => "EBUSY".into(),
+        libc::EINVAL => "EINVAL".into(),
+        libc::ENOSYS => "ENOSYS".into(),
+        libc::EACCES => "EACCES".into(),
+        libc::EFAULT => "EFAULT".into(),
+        libc::ENOMEM => "ENOMEM".into(),
+        libc::EPERM => "EPERM".into(),
+        other => format!("errno_{other}"),
+    }
+}
+
+/// The watcher records a refusal only when its id was still valid after the caller was read.
+fn should_record(still_valid: bool) -> bool {
+    still_valid
+}
+
+/// A caller's executable and argv from the raw bytes of its `/proc` entries, lossy and bounded.
+fn process_details_from(exe: &[u8], cmdline: &[u8]) -> (String, Vec<String>) {
+    let executable = String::from_utf8_lossy(exe)
+        .trim_end_matches('\0')
+        .to_string();
+    let argv = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .take(65)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    (executable, argv)
+}
+
+/// One launch's watcher thread. Dropping it stops the thread within about a second.
+#[cfg(target_os = "linux")]
+pub(crate) struct RefusalWatch {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RefusalWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RefusalRecorder {
+    /// Read `launch`'s handoff from `control`, then answer its refusals until it ends.
+    pub(crate) fn watch(
+        self: &Arc<Self>,
+        control: std::os::unix::net::UnixStream,
+        launch: String,
+    ) -> RefusalWatch {
+        use containment::refusal::{Handoff, Next, describe, receive_handoff};
+        use std::sync::atomic::Ordering;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recorder = Arc::clone(self);
+        let stopping = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("strands-box-refusals".to_string())
+            .spawn(move || {
+                let _ = control.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let handoff = loop {
+                    if stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    match receive_handoff(&control) {
+                        Ok(handoff) => break handoff,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let listener = match handoff {
+                    Handoff::Observed(listener) => listener,
+                    Handoff::Unobserved { errno } => return recorder.unobserved(&launch, errno),
+                    Handoff::Absent => return,
+                };
+                while !stopping.load(Ordering::SeqCst) {
+                    match listener.next(std::time::Duration::from_millis(200)) {
+                        Ok(Next::Notification(notification)) => {
+                            let exe = std::fs::read_link(format!("/proc/{}/exe", notification.pid))
+                                .map(|path| path.into_os_string().into_encoded_bytes())
+                                .unwrap_or_default();
+                            let cmdline =
+                                std::fs::read(format!("/proc/{}/cmdline", notification.pid))
+                                    .unwrap_or_default();
+                            let valid = listener.still_valid(notification.id);
+                            // Answered before anything else can fail: the workload is waiting.
+                            let _ = listener.refuse(notification.id);
+                            if should_record(valid) {
+                                let (executable, argv) = process_details_from(&exe, &cmdline);
+                                let description =
+                                    describe(notification.syscall, &notification.args);
+                                recorder.observe(Observed {
+                                    pid: notification.pid,
+                                    executable,
+                                    argv,
+                                    syscall: description.syscall,
+                                    arguments: description.arguments,
+                                });
+                            }
+                        }
+                        Ok(Next::Idle) => {}
+                        Ok(Next::Ended) | Err(_) => return,
+                    }
+                }
+            })
+            .ok();
+        RefusalWatch { stop, thread }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +489,68 @@ mod tests {
         limiter.admit(&key("b"), now);
         assert_eq!(limiter.drain().pending, vec![(key("b"), 1)]);
         assert!(limiter.drain().pending.is_empty());
+    }
+    fn observed(syscall: &str, pid: u32) -> Observed {
+        Observed {
+            pid,
+            executable: "/usr/bin/python3".into(),
+            argv: vec!["python3".into(), "-c".into(), "token=abc".into()],
+            syscall: syscall.into(),
+            arguments: None,
+        }
+    }
+
+    #[test]
+    fn two_watches_share_one_limiter() {
+        let recorder = RefusalRecorder::discarding();
+        recorder.observe(observed("bpf", 1));
+        recorder.observe(observed("bpf", 2)); // same exe, same call: counted, not recorded
+        let recorded = recorder.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].syscall, "bpf");
+    }
+
+    #[test]
+    fn flush_emits_each_pending_count_as_one_record() {
+        let recorder = RefusalRecorder::discarding();
+        for pid in 0..10 {
+            recorder.observe(observed("bpf", pid));
+        }
+        recorder.flush();
+        let suppressed: Vec<u64> = recorder.recorded().iter().map(|r| r.suppressed).collect();
+        assert_eq!(suppressed, vec![0, 8]); // 1 + 0, then 1 + 8: ten calls
+    }
+
+    #[test]
+    fn a_stale_notification_is_answered_and_not_recorded() {
+        // `Observed` is only built for a valid id; the watcher's gate is `still_valid`.
+        // Pin the gate in the watcher's one decision function.
+        assert!(!should_record(false));
+        assert!(should_record(true));
+    }
+
+    #[test]
+    fn process_details_tolerate_garbage() {
+        let (exe, argv) = process_details_from(b"\xff\xfe/bin/\x00", &[0xff, b'a', 0, b'b', 0]);
+        assert!(exe.contains('\u{fffd}'));
+        assert_eq!(argv.len(), 2);
+        let long = vec![b'x'; 1 << 20];
+        let (_, argv) = process_details_from(b"/bin/x", &long);
+        assert_eq!(argv.len(), 1); // one argument; `Subject` bounds its length
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_a_watch_joins_within_two_seconds() {
+        let recorder = RefusalRecorder::discarding();
+        let (box_side, _silent) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let watch = recorder.watch(box_side, "test".to_string());
+        let started = Instant::now();
+        drop(watch);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }
