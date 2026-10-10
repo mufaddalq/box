@@ -322,8 +322,10 @@ failed with `ENOENT`. A link node is a host link whose parent is canonical. A no
 bind brings in is left to that bind. A node under a read-only empty directory is refused, because it
 cannot be made there. An entry spelled beneath a node, such as the loader `/lib/ld-linux-*.so.1`
 on a host where `/lib` is a link, is planned at the host's resolution of it, because its mountpoint
-would otherwise be made through the link. The links sit on the read-only root, so the workload cannot change them, and a grant
-whose chain changed after it was judged is refused at apply. The cost: a spelling that reaches its
+would otherwise be made through the link. A link on the read-only root cannot be changed by the workload. One under the writable
+`/tmp` can be replaced, but only after the trampoline's exec, and the workload could already make a
+link there to anything in its view. A grant whose chain changed after it was judged is refused at
+apply, and a link whose text no longer leads to a node the grant judged is refused at plan. The cost: a spelling that reaches its
 file through a linked *ancestor*, such as `#!/bin/sh` on a merged-`/usr` host, keeps a bind at the
 spelling and its `$ORIGIN` mismatch, because mirroring `/bin` would move every bind beneath it. A
 `command` never hits this, because its directory is canonicalized first.
