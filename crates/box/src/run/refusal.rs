@@ -1,8 +1,9 @@
 //! Kernel refusals the box observed, rate-limited into telemetry.
 //!
 //! A workload chooses how often it is refused, so the box records the first refusal under each
-//! key at once, counts repeats, and caps how many keys it tracks. Every notification is still
-//! answered: the limit drops records, never responses.
+//! key at once, counts repeats, and caps how many keys it tracks. Past the cap a new key is counted
+//! under its syscall alone, so arguments a workload picks cannot hide a later kind of call. Every
+//! notification is still answered: the limit drops records, never responses.
 
 // Only the Linux watcher feeds the recorder today; macOS joins with Seatbelt violation reports.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -26,8 +27,8 @@ pub(crate) struct RefusalKey {
 pub(crate) enum Admit {
     /// Emit a record standing for this call and `suppressed` earlier ones.
     Record { suppressed: u64 },
-    /// The key cap just filled: emit the one overflow notice.
-    Overflow,
+    /// The first refusal past the key cap: emit the one overflow notice, and a record for this call.
+    FirstOverflow,
     /// Counted, not emitted.
     Nothing,
 }
@@ -41,10 +42,35 @@ pub(crate) struct Drained {
     pub(crate) overflow: u64,
 }
 
+/// Syscall numbers below this are each their own bucket past the cap; every arch Box supports
+/// numbers its calls below it.
+const NUMBERED: u32 = 1024;
+
+/// What a refusal past the key cap is counted under: its syscall, with every number at or past
+/// [`NUMBERED`] in one bucket, so the workload cannot grow the set by calling made-up numbers.
+fn syscall_bucket(syscall: &str) -> String {
+    match syscall
+        .strip_prefix("syscall_")
+        .and_then(|number| number.parse::<u32>().ok())
+    {
+        Some(number) if number >= NUMBERED => "syscall_out_of_range".to_string(),
+        _ => syscall.to_string(),
+    }
+}
+
 #[derive(Debug)]
 struct Window {
     opened: Instant,
     count: u64,
+}
+
+impl Window {
+    fn opened(now: Instant) -> Self {
+        Self {
+            opened: now,
+            count: 0,
+        }
+    }
 }
 
 /// One box's refusal limiter, shared by every launch in it.
@@ -53,6 +79,8 @@ pub(crate) struct RefusalLimiter {
     window: Duration,
     cap: usize,
     keys: HashMap<RefusalKey, Window>,
+    /// Past the cap: one window per syscall bucket, bounded by the buckets there are.
+    by_syscall: HashMap<RefusalKey, Window>,
     overflow: u64,
 }
 
@@ -67,45 +95,58 @@ impl RefusalLimiter {
             window,
             cap,
             keys: HashMap::new(),
+            by_syscall: HashMap::new(),
             overflow: 0,
         }
     }
 
     pub(crate) fn admit(&mut self, key: &RefusalKey, now: Instant) -> Admit {
-        if let Some(window) = self.keys.get_mut(key) {
-            if now.saturating_duration_since(window.opened) < self.window {
-                window.count += 1;
-                return Admit::Nothing;
-            }
-            let suppressed = window.count;
-            *window = Window {
-                opened: now,
-                count: 0,
-            };
-            return Admit::Record { suppressed };
+        if let Some(admit) = Self::repeat(&mut self.keys, key, now, self.window) {
+            return admit;
         }
         if self.keys.len() < self.cap {
-            self.keys.insert(
-                key.clone(),
-                Window {
-                    opened: now,
-                    count: 0,
-                },
-            );
+            self.keys.insert(key.clone(), Window::opened(now));
             return Admit::Record { suppressed: 0 };
         }
         self.overflow += 1;
-        if self.overflow == 1 {
-            Admit::Overflow
-        } else {
-            Admit::Nothing
+        let coarse = RefusalKey {
+            executable: String::new(),
+            syscall: syscall_bucket(&key.syscall),
+            arguments: None,
+        };
+        if let Some(admit) = Self::repeat(&mut self.by_syscall, &coarse, now, self.window) {
+            return admit;
         }
+        self.by_syscall.insert(coarse, Window::opened(now));
+        if self.overflow == 1 {
+            Admit::FirstOverflow
+        } else {
+            Admit::Record { suppressed: 0 }
+        }
+    }
+
+    /// The decision for a key already tracked in `windows`, or `None` for a new one.
+    fn repeat(
+        windows: &mut HashMap<RefusalKey, Window>,
+        key: &RefusalKey,
+        now: Instant,
+        length: Duration,
+    ) -> Option<Admit> {
+        let window = windows.get_mut(key)?;
+        if now.saturating_duration_since(window.opened) < length {
+            window.count += 1;
+            return Some(Admit::Nothing);
+        }
+        let suppressed = window.count;
+        *window = Window::opened(now);
+        Some(Admit::Record { suppressed })
     }
 
     pub(crate) fn drain(&mut self) -> Drained {
         let mut pending: Vec<(RefusalKey, u64)> = self
             .keys
             .iter_mut()
+            .chain(self.by_syscall.iter_mut())
             .filter(|(_, window)| window.count > 0)
             .map(|(key, window)| (key.clone(), std::mem::take(&mut window.count)))
             .collect();
@@ -199,7 +240,10 @@ impl RefusalRecorder {
         };
         match admitted {
             Admit::Record { suppressed } => self.emit(&refusal, suppressed),
-            Admit::Overflow => self.control("box", "rate_cap", None),
+            Admit::FirstOverflow => {
+                self.control("box", "rate_cap", None);
+                self.emit(&refusal, 0);
+            }
             Admit::Nothing => {}
         }
     }
@@ -490,8 +534,15 @@ mod tests {
         assert_eq!(total, 100_000);
     }
 
+    fn keyed(syscall: &str, arguments: &str) -> RefusalKey {
+        RefusalKey {
+            arguments: Some(arguments.into()),
+            ..key(syscall)
+        }
+    }
+
     #[test]
-    fn past_the_cap_a_new_key_announces_overflow_once_and_is_counted() {
+    fn past_the_cap_new_keys_are_counted_per_syscall() {
         let mut limiter = RefusalLimiter::new(Duration::from_secs(10), 2);
         let now = Instant::now();
         assert_eq!(
@@ -502,14 +553,51 @@ mod tests {
             limiter.admit(&key("b"), now),
             Admit::Record { suppressed: 0 }
         );
-        assert_eq!(limiter.admit(&key("c"), now), Admit::Overflow);
-        assert_eq!(limiter.admit(&key("d"), now), Admit::Nothing);
-        assert_eq!(limiter.admit(&key("c"), now), Admit::Nothing);
+        // The first key past the cap announces it, and is still recorded under its syscall.
+        assert_eq!(limiter.admit(&key("c"), now), Admit::FirstOverflow);
+        // Another syscall past the cap keeps its own record.
+        assert_eq!(
+            limiter.admit(&key("d"), now),
+            Admit::Record { suppressed: 0 }
+        );
+        // New arguments to a syscall already counted past the cap are only counted.
+        assert_eq!(limiter.admit(&keyed("c", "x=1"), now), Admit::Nothing);
         // A key admitted before the cap keeps working.
         assert_eq!(limiter.admit(&key("a"), now), Admit::Nothing);
+        assert_eq!(
+            limiter.admit(&keyed("c", "x=2"), now + Duration::from_secs(11)),
+            Admit::Record { suppressed: 1 }
+        );
         let drained = limiter.drain();
-        assert_eq!(drained.overflow, 3);
+        assert_eq!(drained.overflow, 4);
         assert_eq!(drained.pending, vec![(key("a"), 1)]);
+    }
+
+    #[test]
+    fn records_and_suppressed_counts_sum_to_every_call_past_the_cap() {
+        let mut limiter = RefusalLimiter::new(Duration::from_secs(10), 4);
+        let start = Instant::now();
+        let mut total = 0u64;
+        for call in 0..50_000u64 {
+            let refusal = keyed(&format!("s{}", call % 20), &format!("x={}", call % 7));
+            match limiter.admit(&refusal, start + Duration::from_millis(call)) {
+                Admit::Record { suppressed } => total += 1 + suppressed,
+                Admit::FirstOverflow => total += 1,
+                Admit::Nothing => {}
+            }
+        }
+        for (_, pending) in limiter.drain().pending {
+            total += pending;
+        }
+        assert_eq!(total, 50_000);
+    }
+
+    #[test]
+    fn a_numbered_syscall_past_the_known_range_shares_one_bucket() {
+        assert_eq!(syscall_bucket("syscall_99999"), "syscall_out_of_range");
+        assert_eq!(syscall_bucket("syscall_70000"), "syscall_out_of_range");
+        assert_eq!(syscall_bucket("syscall_216"), "syscall_216");
+        assert_eq!(syscall_bucket("bpf"), "bpf");
     }
 
     #[test]
@@ -559,7 +647,8 @@ mod tests {
         recorder.observe(observed("ptrace", 1));
         recorder.observe(observed("mount", 1));
         recorder.flush();
-        assert_eq!(recorder.recorded().len(), 1);
+        let syscalls: Vec<String> = recorder.recorded().into_iter().map(|r| r.syscall).collect();
+        assert_eq!(syscalls, vec!["bpf", "ptrace", "mount"]);
         assert_eq!(
             recorder.controls(),
             vec![
@@ -571,6 +660,26 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_flood_of_distinct_arguments_does_not_hide_a_later_syscall() {
+        let recorder = RefusalRecorder::discarding();
+        for pid in 0..300 {
+            recorder.observe(Observed {
+                arguments: Some(format!("pid={pid} pgid=0")),
+                ..observed("setpgid", 1)
+            });
+        }
+        recorder.observe(observed("bpf", 1));
+        let recorded = recorder.recorded();
+        assert!(recorded.iter().any(|r| r.syscall == "bpf"));
+        // 256 keyed records, then one for setpgid past the cap; the rest are counted.
+        assert_eq!(
+            recorded.iter().filter(|r| r.syscall == "setpgid").count(),
+            257
+        );
+        assert_eq!(recorder.controls().len(), 1);
     }
 
     #[test]
