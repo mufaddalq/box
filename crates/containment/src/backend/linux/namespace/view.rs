@@ -335,6 +335,50 @@ impl MountView {
         }
         entries.extend(links);
 
+        // **An entry spelled beneath a link is planned at the host's resolution of it.** The kernel
+        // reaches it through the link in the view as it does on the host, and creating its
+        // mountpoint at the spelling would follow the link, which can lead into a bind and onto the
+        // host. A loader whose program header names `/lib/ld-linux-*.so.1` on a host where `/lib`
+        // is itself a link is the case that needs it. The resolution has a canonical parent, so it
+        // lies beneath no link. It merges into an entry already at that path, and a dependency an
+        // exec-capable tree already covers is dropped, as above.
+        let link_targets: Vec<PathBuf> = entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, MountKind::Symlink { .. }))
+            .map(|entry| entry.target.clone())
+            .collect();
+        let beneath_a_link = |path: &Path| {
+            link_targets
+                .iter()
+                .any(|link| path != link && path.starts_with(link))
+        };
+        let mut respelled: Vec<MountEntry> = Vec::with_capacity(entries.len());
+        for entry in entries.drain(..) {
+            if !beneath_a_link(&entry.target) {
+                respelled.push(entry);
+                continue;
+            }
+            let target = host_resolution(&entry.target);
+            if matches!(
+                entry.origin,
+                MountOrigin::Interpreter | MountOrigin::Library
+            ) && covering.iter().any(|tree| target.starts_with(tree))
+            {
+                continue;
+            }
+            if let Some(existing) = respelled
+                .iter_mut()
+                .find(|planned| planned.target == target)
+            {
+                existing.writable |= entry.writable;
+                existing.executable |= entry.executable;
+                continue;
+            }
+            respelled.push(MountEntry { target, ..entry });
+        }
+        entries = respelled;
+        dedup = entries.iter().map(|entry| entry.target.clone()).collect();
+
         // **A grant inside another grant's tree is established after it, whatever order the two
         // were stated in.** A nested bind sits on top of the tree that encloses it, and its own
         // flags decide what the workload finds there: a bind that is not an exec grant is no-exec,
@@ -453,6 +497,11 @@ impl MountView {
                 MountKind::Fresh { fstype: "tmpfs" }
             };
             for target in refused.reachable_paths() {
+                let target = if beneath_a_link(&target) {
+                    host_resolution(&target)
+                } else {
+                    target
+                };
                 let entry = MountEntry {
                     source: None,
                     target: target.clone(),
@@ -1348,6 +1397,15 @@ fn is_link_node(path: &Path) -> bool {
         && path
             .parent()
             .is_some_and(|parent| parent.canonicalize().is_ok_and(|real| real == parent))
+}
+
+/// The path as the host resolves it: its parent canonical, its final component kept. A path whose
+/// parent does not resolve is returned as it is.
+fn host_resolution(path: &Path) -> PathBuf {
+    match (path.parent().map(Path::canonicalize), path.file_name()) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// The links a lookup of `granted` traverses that the view reproduces, in walk order.
@@ -2757,52 +2815,88 @@ mod tests {
         );
     }
 
-    /// **An entry spelled beneath a mirrored link is refused**: creating its mountpoint would
-    /// follow the link, possibly into a bind and onto the host.
-    #[test]
-    fn an_entry_beneath_a_planned_link_is_refused() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = directory.path().canonicalize().expect("root");
+    /// A directory `real` holding `f` and `secret`, and `link → real` beside it.
+    fn linked_directory(directory: &Path) -> (PathBuf, PathBuf) {
+        let root = directory.canonicalize().expect("root");
         let real = root.join("real");
         std::fs::create_dir(&real).expect("real dir");
         std::fs::write(real.join("f"), b"x").expect("file");
+        std::fs::write(real.join("secret"), b"x").expect("secret");
         let link = root.join("link");
         std::os::unix::fs::symlink(&real, &link).expect("dir link");
+        (real, link)
+    }
 
+    /// No planned entry lies strictly beneath a planned link.
+    fn nothing_beneath_a_link(entries: &[MountEntry]) -> bool {
+        entries
+            .iter()
+            .filter(|link| matches!(link.kind, MountKind::Symlink { .. }))
+            .all(|link| {
+                !entries.iter().any(|entry| {
+                    entry.target != link.target && entry.target.starts_with(&link.target)
+                })
+            })
+    }
+
+    /// **An entry spelled beneath a mirrored link is planned at the host's resolution of it**:
+    /// never created through the link, which could lead into a bind and onto the host.
+    #[test]
+    fn an_entry_beneath_a_planned_link_is_planned_at_its_resolution() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (real, link) = linked_directory(directory.path());
         let config = ContainmentConfig::new()
             .allow(&link, Operation::Read, Scope::Root)
             .expect("read through the dir link")
             .allow(link.join("f"), Operation::Read, Scope::File)
             .expect("read a file under the link");
-        let error = MountView::plan(&config).expect_err("an entry beneath a link");
-        assert!(
-            error.to_string().contains(&link.display().to_string()),
-            "the refusal names the link: {error}"
+        let entries = planned(&config);
+        assert!(nothing_beneath_a_link(&entries), "{entries:#?}");
+        assert_eq!(
+            entry_for(&entries, &link).kind,
+            MountKind::Symlink { text: real.clone() }
         );
+        assert_eq!(entry_for(&entries, &real).kind, MountKind::Bind);
     }
 
-    /// **A refusal spelled beneath a mirrored link is refused too**: refusals are planned after the
-    /// link pass, and the rule covers every entry.
+    /// **A refusal spelled beneath a mirrored link still refuses**, at the host's resolution.
     #[test]
-    fn a_refusal_beneath_a_planned_link_is_refused() {
+    fn a_refusal_beneath_a_planned_link_refuses_its_resolution() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let root = directory.path().canonicalize().expect("root");
-        let real = root.join("real");
-        std::fs::create_dir(&real).expect("real dir");
-        std::fs::write(real.join("secret"), b"x").expect("file");
-        let link = root.join("link");
-        std::os::unix::fs::symlink(&real, &link).expect("dir link");
-
+        let (real, link) = linked_directory(directory.path());
         let config = ContainmentConfig::new()
             .allow(&link, Operation::Read, Scope::Root)
             .expect("read through the dir link")
             .refuse(link.join("secret"), Scope::File)
             .expect("refuse a file under the link");
-        let error = MountView::plan(&config).expect_err("a refusal beneath a link");
-        assert!(
-            error.to_string().contains(&link.display().to_string()),
-            "the refusal names the link: {error}"
-        );
+        let entries = planned(&config);
+        assert!(nothing_beneath_a_link(&entries), "{entries:#?}");
+        let refused = entry_for(&entries, &real.join("secret"));
+        assert_eq!(refused.origin, MountOrigin::Refusal);
+        assert_eq!(refused.kind, MountKind::EmptyFile);
+    }
+
+    /// **A tool's `/lib` read root on a merged-`/usr` host plans, and the ELF interpreter its
+    /// program header spells under `/lib` is reached through the link** rather than refused.
+    #[test]
+    fn a_linked_loader_directory_and_an_interpreter_spelled_through_it_plan() {
+        if !std::fs::symlink_metadata("/lib").is_ok_and(|metadata| metadata.is_symlink()) {
+            println!("skipping: /lib is not a link on this host");
+            return;
+        }
+        let config = ContainmentConfig::new()
+            .allow("/lib", Operation::Read, Scope::Root)
+            .expect("read /lib")
+            .allow("/usr/lib", Operation::Read, Scope::Root)
+            .expect("read /usr/lib")
+            .allow("/bin/sh", Operation::Exec, Scope::File)
+            .expect("exec /bin/sh");
+        let entries = planned(&config);
+        assert!(nothing_beneath_a_link(&entries), "{entries:#?}");
+        assert!(matches!(
+            entry_for(&entries, Path::new("/lib")).kind,
+            MountKind::Symlink { .. }
+        ));
     }
 
     /// **A spelling through a linked ancestor keeps its bind**: its parent is not canonical, so it

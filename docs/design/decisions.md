@@ -320,8 +320,9 @@ built with `RUNPATH $ORIGIN/../lib` lost `libpython`. A hop that no grant names,
 `/usr/local/bin/python3` between a venv and its interpreter, was not in the view at all, so `exec`
 failed with `ENOENT`. A link node is a host link whose parent is canonical. A node that a directory
 bind brings in is left to that bind. A node under a read-only empty directory is refused, because it
-cannot be made there, and any entry beneath a node is refused, because its mountpoint would be made
-through the link. The links sit on the read-only root, so the workload cannot change them, and a grant
+cannot be made there. An entry spelled beneath a node, such as the loader `/lib/ld-linux-*.so.1`
+on a host where `/lib` is a link, is planned at the host's resolution of it, because its mountpoint
+would otherwise be made through the link. The links sit on the read-only root, so the workload cannot change them, and a grant
 whose chain changed after it was judged is refused at apply. The cost: a spelling that reaches its
 file through a linked *ancestor*, such as `#!/bin/sh` on a merged-`/usr` host, keeps a bind at the
 spelling and its `$ORIGIN` mismatch, because mirroring `/bin` would move every bind beneath it. A
