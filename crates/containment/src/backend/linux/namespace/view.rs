@@ -617,11 +617,42 @@ impl MountView {
         };
 
         match &entry.kind {
-            MountKind::Symlink { .. } => {
-                return Err(refusal(format!(
-                    "establishing the link '{}' is not implemented",
-                    entry.target.display()
-                )));
+            MountKind::Symlink { text } => {
+                // Never through a bind: that would create the link on the host. The plan left every
+                // enclosed node to its bind, so this is defence in depth.
+                if self.enclosed_by_a_bind(&entry.target) {
+                    return Err(refusal(format!(
+                        "the link '{}' lies inside a bind, and creating it would create it on \
+                         the host",
+                        entry.target.display()
+                    )));
+                }
+                match std::fs::symlink_metadata(&target) {
+                    Ok(metadata)
+                        if metadata.is_symlink()
+                            && std::fs::read_link(&target).is_ok_and(|now| &now == text) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        return Err(refusal(format!(
+                            "the link '{}' cannot be made: something else is already there",
+                            entry.target.display()
+                        )));
+                    }
+                    Err(_) => {}
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| refusal(format!("creating '{}': {e}", parent.display())))?;
+                }
+                std::os::unix::fs::symlink(text, &target).map_err(|e| {
+                    refusal(format!(
+                        "creating the link '{}' -> '{}': {e}",
+                        entry.target.display(),
+                        text.display()
+                    ))
+                })?;
             }
             MountKind::Fresh { fstype } => {
                 std::fs::create_dir_all(&target)
