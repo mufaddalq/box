@@ -4,6 +4,7 @@ pub(crate) mod authority;
 pub(crate) mod netns;
 pub(crate) mod probe;
 pub(crate) mod reaper;
+pub(crate) mod refusal;
 pub(crate) mod syscall;
 pub(crate) mod view;
 
