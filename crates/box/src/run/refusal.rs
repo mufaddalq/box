@@ -141,6 +141,9 @@ pub(crate) struct RefusalRecorder {
     limiter: Mutex<RefusalLimiter>,
     #[cfg(test)]
     recorded: Mutex<Vec<Emitted>>,
+    /// Test-only: each control record's subject, reason, and detail.
+    #[cfg(test)]
+    controls: Mutex<Vec<(String, String, Option<String>)>>,
 }
 
 impl RefusalRecorder {
@@ -153,19 +156,29 @@ impl RefusalRecorder {
             )),
             #[cfg(test)]
             recorded: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            controls: Mutex::new(Vec::new()),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn discarding() -> Arc<Self> {
+        Self::discarding_with_cap(RefusalLimiter::CAP)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discarding_with_cap(cap: usize) -> Arc<Self> {
         Arc::new(Self {
             collector: None,
-            limiter: Mutex::new(RefusalLimiter::new(
-                RefusalLimiter::WINDOW,
-                RefusalLimiter::CAP,
-            )),
+            limiter: Mutex::new(RefusalLimiter::new(RefusalLimiter::WINDOW, cap)),
             recorded: Mutex::new(Vec::new()),
+            controls: Mutex::new(Vec::new()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controls(&self) -> Vec<(String, String, Option<String>)> {
+        self.controls.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -186,22 +199,14 @@ impl RefusalRecorder {
         };
         match admitted {
             Admit::Record { suppressed } => self.emit(&refusal, suppressed),
-            Admit::Overflow => self.control(telemetry::ControlRecord::refused(
-                telemetry::ControlOperation::RefusalsUnobserved,
-                "box",
-                "rate_cap",
-            )),
+            Admit::Overflow => self.control("box", "rate_cap", None),
             Admit::Nothing => {}
         }
     }
 
     /// One launch's install fell back, so its refusals are not observed.
     pub(crate) fn unobserved(&self, launch: &str, errno: i32) {
-        self.control(telemetry::ControlRecord::refused(
-            telemetry::ControlOperation::RefusalsUnobserved,
-            launch,
-            &errno_name(errno),
-        ));
+        self.control(launch, &errno_name(errno), None);
     }
 
     /// Emit every pending count and the overflow tally. Called on drop, and safe to call twice.
@@ -222,12 +227,9 @@ impl RefusalRecorder {
         }
         if drained.overflow > 0 {
             self.control(
-                telemetry::ControlRecord::refused(
-                    telemetry::ControlOperation::RefusalsUnobserved,
-                    "box",
-                    "rate_cap",
-                )
-                .detailed(&format!("{} refusals", drained.overflow)),
+                "box",
+                "rate_cap",
+                Some(format!("{} refusals", drained.overflow)),
             );
         }
     }
@@ -255,9 +257,22 @@ impl RefusalRecorder {
         }
     }
 
-    fn control(&self, record: telemetry::ControlRecord) {
+    /// One `refusals_unobserved` control record.
+    fn control(&self, subject: &str, reason: &str, detail: Option<String>) {
+        #[cfg(test)]
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.push((subject.to_string(), reason.to_string(), detail.clone()));
+        }
         if let Some(collector) = &self.collector {
-            collector.control(record);
+            let record = telemetry::ControlRecord::refused(
+                telemetry::ControlOperation::RefusalsUnobserved,
+                subject,
+                reason,
+            );
+            collector.control(match &detail {
+                Some(detail) => record.detailed(detail),
+                None => record,
+            });
         }
     }
 }
@@ -284,9 +299,29 @@ fn errno_name(errno: i32) -> String {
     }
 }
 
-/// The watcher records a refusal only when its id was still valid after the caller was read.
-fn should_record(still_valid: bool) -> bool {
-    still_valid
+/// One refusal as the watcher records it. The syscall and its arguments come from the kernel and
+/// are always kept; the caller's `/proc` details are dropped when the id went stale while they were
+/// read, since the pid may name another process by then.
+fn observed_from(
+    still_valid: bool,
+    pid: u32,
+    exe: &[u8],
+    cmdline: &[u8],
+    syscall: String,
+    arguments: Option<String>,
+) -> Observed {
+    let (executable, argv) = if still_valid {
+        process_details_from(exe, cmdline)
+    } else {
+        (String::new(), Vec::new())
+    };
+    Observed {
+        pid,
+        executable,
+        argv,
+        syscall,
+        arguments,
+    }
 }
 
 /// A caller's executable and argv from the raw bytes of its `/proc` entries, lossy and bounded.
@@ -374,18 +409,15 @@ impl RefusalRecorder {
                             let valid = listener.still_valid(notification.id);
                             // Answered before anything else can fail: the workload is waiting.
                             let _ = listener.refuse(notification.id);
-                            if should_record(valid) {
-                                let (executable, argv) = process_details_from(&exe, &cmdline);
-                                let description =
-                                    describe(notification.syscall, &notification.args);
-                                recorder.observe(Observed {
-                                    pid: notification.pid,
-                                    executable,
-                                    argv,
-                                    syscall: description.syscall,
-                                    arguments: description.arguments,
-                                });
-                            }
+                            let description = describe(notification.syscall, &notification.args);
+                            recorder.observe(observed_from(
+                                valid,
+                                notification.pid,
+                                &exe,
+                                &cmdline,
+                                description.syscall,
+                                description.arguments,
+                            ));
                         }
                         Ok(Next::Idle) => {}
                         Ok(Next::Ended) | Err(_) => return,
@@ -501,13 +533,44 @@ mod tests {
     }
 
     #[test]
-    fn two_watches_share_one_limiter() {
+    fn a_repeat_from_another_pid_is_counted_under_the_same_key() {
         let recorder = RefusalRecorder::discarding();
         recorder.observe(observed("bpf", 1));
         recorder.observe(observed("bpf", 2)); // same exe, same call: counted, not recorded
         let recorded = recorder.recorded();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].syscall, "bpf");
+    }
+
+    #[test]
+    fn a_fallback_is_announced_with_its_launch_and_errno() {
+        let recorder = RefusalRecorder::discarding();
+        recorder.unobserved("mcp:files", libc::EBUSY);
+        assert_eq!(
+            recorder.controls(),
+            vec![("mcp:files".to_string(), "EBUSY".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn the_cap_is_announced_once_and_its_count_flushed_at_stop() {
+        let recorder = RefusalRecorder::discarding_with_cap(1);
+        recorder.observe(observed("bpf", 1));
+        recorder.observe(observed("ptrace", 1));
+        recorder.observe(observed("mount", 1));
+        recorder.flush();
+        assert_eq!(recorder.recorded().len(), 1);
+        assert_eq!(
+            recorder.controls(),
+            vec![
+                ("box".to_string(), "rate_cap".to_string(), None),
+                (
+                    "box".to_string(),
+                    "rate_cap".to_string(),
+                    Some("2 refusals".to_string())
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -522,11 +585,28 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_notification_is_answered_and_not_recorded() {
-        // `Observed` is only built for a valid id; the watcher's gate is `still_valid`.
-        // Pin the gate in the watcher's one decision function.
-        assert!(!should_record(false));
-        assert!(should_record(true));
+    fn a_stale_notification_is_recorded_without_its_process() {
+        // The syscall and its arguments come from the kernel; only what `/proc` said may belong to
+        // another process by now. A workload that interrupts its own refused call is still seen.
+        let refusal = observed_from(
+            false,
+            7,
+            b"/usr/bin/other",
+            b"other\0--flag\0",
+            "bpf".into(),
+            None,
+        );
+        assert_eq!(refusal.syscall, "bpf");
+        assert_eq!(refusal.pid, 7);
+        assert!(refusal.executable.is_empty());
+        assert!(refusal.argv.is_empty());
+        let recorder = RefusalRecorder::discarding();
+        recorder.observe(refusal);
+        assert_eq!(recorder.recorded().len(), 1);
+
+        let valid = observed_from(true, 7, b"/bin/x", b"x\0-v\0", "bpf".into(), None);
+        assert_eq!(valid.executable, "/bin/x");
+        assert_eq!(valid.argv, vec!["x".to_string(), "-v".to_string()]);
     }
 
     #[test]
@@ -545,12 +625,12 @@ mod tests {
         let recorder = RefusalRecorder::discarding();
         let (box_side, _silent) = std::os::unix::net::UnixStream::pair().expect("pair");
         let watch = recorder.watch(box_side, "test".to_string());
-        let started = Instant::now();
-        drop(watch);
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
+        let (done, joined) = std::sync::mpsc::channel();
+        // Dropped on its own thread, so a watch that never stops fails the test instead of hanging it.
+        std::thread::spawn(move || {
+            drop(watch);
+            let _ = done.send(());
+        });
+        assert!(joined.recv_timeout(Duration::from_secs(2)).is_ok());
     }
 }

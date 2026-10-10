@@ -271,18 +271,23 @@ fn at_flags(value: u64) -> String {
     }
 }
 
-/// The errno names an install failure can carry, for the control record and the stderr line.
-pub(crate) fn errno_name(errno: i32) -> &'static str {
-    match errno {
-        libc::EBUSY => "EBUSY",
-        libc::EINVAL => "EINVAL",
-        libc::ENOSYS => "ENOSYS",
-        libc::EACCES => "EACCES",
-        libc::EFAULT => "EFAULT",
-        libc::ENOMEM => "ENOMEM",
-        libc::EPERM => "EPERM",
-        // Leaked once per distinct unknown errno, which a fallback reports at most once per launch.
-        other => Box::leak(format!("errno_{other}").into_boxed_str()),
+/// The errno name an install failure carries, for the stderr line. Formats without allocating,
+/// so PID 1 can write it after the fork.
+pub(crate) struct ErrnoName(pub(crate) i32);
+
+impl std::fmt::Display for ErrnoName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.0 {
+            libc::EBUSY => "EBUSY",
+            libc::EINVAL => "EINVAL",
+            libc::ENOSYS => "ENOSYS",
+            libc::EACCES => "EACCES",
+            libc::EFAULT => "EFAULT",
+            libc::ENOMEM => "ENOMEM",
+            libc::EPERM => "EPERM",
+            other => return write!(f, "errno_{other}"),
+        };
+        f.write_str(name)
     }
 }
 
@@ -454,7 +459,7 @@ pub(crate) fn forward_listener(
                 // no longer be stacked over.
                 eprintln!(
                     "strands-box: namespace reaper could not hand the seccomp listener to the box: {}",
-                    errno_name(errno)
+                    ErrnoName(errno)
                 );
                 let _ = write_message(sync, NOT_FORWARDED, errno);
             }
@@ -472,7 +477,7 @@ pub(crate) fn forward_listener(
 fn warn_unobserved(errno: i32) {
     eprintln!(
         "strands-box-contain-trampoline: warning: seccomp refusals are not observed: {}",
-        errno_name(errno)
+        ErrnoName(errno)
     );
 }
 
@@ -697,11 +702,12 @@ mod tests {
 
     #[test]
     fn errno_names_cover_the_install_failures() {
-        assert_eq!(errno_name(libc::EBUSY), "EBUSY");
-        assert_eq!(errno_name(libc::EINVAL), "EINVAL");
-        assert_eq!(errno_name(libc::ENOSYS), "ENOSYS");
-        assert_eq!(errno_name(libc::EACCES), "EACCES");
-        assert_eq!(errno_name(libc::EFAULT), "EFAULT");
-        assert_eq!(errno_name(12345), "errno_12345");
+        assert_eq!(ErrnoName(libc::EBUSY).to_string(), "EBUSY");
+        assert_eq!(ErrnoName(libc::EINVAL).to_string(), "EINVAL");
+        assert_eq!(ErrnoName(libc::ENOSYS).to_string(), "ENOSYS");
+        assert_eq!(ErrnoName(libc::EACCES).to_string(), "EACCES");
+        assert_eq!(ErrnoName(libc::EFAULT).to_string(), "EFAULT");
+        // An unknown errno is written as its number, with nothing allocated after the fork.
+        assert_eq!(ErrnoName(12345).to_string(), "errno_12345");
     }
 }
