@@ -1,7 +1,7 @@
 name: "Workload: Agent Suite (gated)"
 
 # The agent-driven suite in `test-workload/` -- the one that puts a real coding agent
-# in a box and asks whether the box holds. SCAFFOLD: see "Not yet runnable" below.
+# in a box and asks whether the box holds. See "Running it" below.
 #
 # ## Why this is gated and the deterministic suite is not
 #
@@ -27,20 +27,12 @@ name: "Workload: Agent Suite (gated)"
 # has no PR trigger at all, so it reports no check on a pull request and cannot
 # block one. (No ruleset on this repo requires any status check either.)
 #
-# ## Not yet runnable
+# ## Running it
 #
-# Every account-specific value is a required input with no default,
-# and `require_inputs` (common/lib.sh) refuses a driver missing any. None of those
-# exists as a repository secret yet, so an approved run currently fails fast at
-# `require_inputs` with the list of what is missing. That failure is honest and
-# non-blocking; it is not a containment result. To make this workflow functional a
-# maintainer must populate the secrets in the "Required secrets" table and stand up
-# the OIDC role, VPC, security group, instance profile, AMIs, and bucket in a test
-# account. The approval gate itself needs no setup — `manual-approval` already exists
-# with its reviewer rule — so the gate is in force even while the run cannot succeed.
-#
-# As of this scaffold the suite has never run from this repository. Treat the first
-# green run as a new baseline, not a regression check.
+# Every account-specific value is a repository secret (table below), and
+# `require_inputs` (common/lib.sh) refuses a driver missing any. The jailbreak case
+# passes only when the agent ran a valid campaign and reached none of the harness's
+# canaries (test-workload/README.md).
 #
 # ## Required secrets
 #
@@ -154,7 +146,7 @@ jobs:
           if ! require_inputs AWS_ACCOUNT KEY_PAIR VPC_ID SECURITY_GROUP \
                  INSTANCE_PROFILE LINUX_AMI MACOS_AMI ARTIFACTS_BUCKET; then
             echo ""
-            echo "This workflow is a SCAFFOLD: the repository has no test account wired up yet."
+            echo "A required repository secret is missing."
             echo "See the 'Required secrets' table in this workflow file."
             echo "This failure is not a containment result and does not block the merge."
             exit 1
@@ -211,19 +203,6 @@ jobs:
             bash test-workload/manual/setup.sh "$platform" --run
           fi
 
-      # An aborted run that leaves a Dedicated Host allocated keeps billing. Gated on
-      # `creds` because a failure before the role assumption cannot have provisioned
-      # anything, and the warning below would then be a false alarm on every such run.
-      - name: Teardown
-        if: ${{ always() && inputs.teardown && steps.creds.outcome == 'success' }}
-        env:
-          AWS_ACCOUNT: ${{ secrets.WORKLOAD_AWS_ACCOUNT }}
-          AWS_REGION: us-west-2
-          ARTIFACTS_BUCKET: ${{ secrets.WORKLOAD_ARTIFACTS_BUCKET }}
-        run: |
-          bash test-workload/manual/teardown.sh --full || \
-            echo "::error::Teardown FAILED. Check for instances and Dedicated Hosts tagged Project=strands-box-containment-tests in $AWS_REGION -- a Dedicated Host keeps billing until released."
-
       # The ledger in S3 is the durable record; this is the convenience copy on the
       # run itself, so a reviewer can read a verdict without bucket access.
       - name: Upload the verdict tree
@@ -235,8 +214,6 @@ jobs:
           path: |
             **/verdict.json
             **/finding.json
-            **/validation_report.md
-            **/method_report.md
           if-no-files-found: warn
           retention-days: 14
 
@@ -270,3 +247,16 @@ jobs:
           else
             echo "::warning title=Workload report::no report artifact was produced by this run"
           fi
+
+      # An aborted run that leaves a Dedicated Host allocated keeps billing. Gated on
+      # `creds` because a failure before the role assumption cannot have provisioned
+      # anything, and the warning below would then be a false alarm on every such run.
+      - name: Teardown
+        if: ${{ always() && inputs.teardown && steps.creds.outcome == 'success' }}
+        env:
+          AWS_ACCOUNT: ${{ secrets.WORKLOAD_AWS_ACCOUNT }}
+          AWS_REGION: us-west-2
+          ARTIFACTS_BUCKET: ${{ secrets.WORKLOAD_ARTIFACTS_BUCKET }}
+        run: |
+          bash test-workload/manual/teardown.sh --full || \
+            echo "::error::Teardown FAILED. Check for instances and Dedicated Hosts tagged Project=strands-box-containment-tests in $AWS_REGION -- a Dedicated Host keeps billing until released."
