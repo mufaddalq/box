@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::ContainmentConfig;
 use crate::error::ContainmentError;
-use crate::model::{Operation, Scope};
+use crate::model::{Operation, PathGrant, Scope};
 
 use super::MECHANISM;
 
 /// What provides an entry's bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MountKind {
     /// A bind of an existing host file or directory.
     Bind,
@@ -21,6 +21,11 @@ pub(crate) enum MountKind {
     },
     /// A fresh empty regular file, with no host contents.
     EmptyFile,
+    /// A symbolic link with the host's own text, so a lookup walks the chain the host walks.
+    Symlink {
+        /// The link's text as `readlink` returned it on the host, relative or absolute.
+        text: PathBuf,
+    },
 }
 
 /// Why an entry is in the view. Carried so a reader of a planned view can tell a
@@ -33,6 +38,8 @@ pub(crate) enum MountOrigin {
     Interpreter,
     /// A shared library an executable grant needs.
     Library,
+    /// A link a grant's lookup traverses, reproduced so the kernel walks the host's chain.
+    Link,
     /// A pathname Unix socket the workload may connect to — a broker route.
     Socket,
     /// Part of the launcher's fixed scaffold: the root, `/proc`, `/tmp`, `/dev`.
@@ -153,7 +160,7 @@ impl MountView {
             // A pathname socket grant needs the socket *file* present, or `connect(2)` fails with
             // `ENOENT` before any authorization is consulted. Brought in writable.
             if granted.operation == Operation::Connect {
-                for target in granted.reachable_paths() {
+                for target in bound_spellings(granted) {
                     if dedup.insert(target.clone()) {
                         entries.push(MountEntry {
                             source: Some(resolved.clone()),
@@ -183,7 +190,7 @@ impl MountView {
             // `Metadata` at `Dir` scope lands here too: an empty filesystem is stricter than the
             // entry's own metadata, so it holds the requirement rather than widening it.
             if granted.scope == Scope::Dir {
-                for target in granted.reachable_paths() {
+                for target in bound_spellings(granted) {
                     let has_granted_descendant = config.authorizations().iter().any(|candidate| {
                         candidate
                             .reachable_paths()
@@ -217,9 +224,10 @@ impl MountView {
                     && granted.scope == Scope::Root
                     && is_loader_directory(&resolved);
 
-            // A grant is bound under BOTH its spellings, to the same source. A path granted read
-            // and write arrives as two grants, so the second ORs the first entry's flags.
-            for target in granted.reachable_paths() {
+            // A grant is bound at each spelling that is not a link node, to the same source. A link
+            // node is reproduced as a link below, so the kernel resolves it to this bind. A path
+            // granted read and write arrives as two grants, so the second ORs the first entry's flags.
+            for target in bound_spellings(granted) {
                 if dedup.insert(target.clone()) {
                     entries.push(MountEntry {
                         source: Some(resolved.clone()),
@@ -277,6 +285,55 @@ impl MountView {
                 }
             }
         }
+
+        // **Each link a grant's lookup traverses is planned as that link.** Bound as a second file,
+        // a link spelling runs as itself: `/proc/self/exe` and the loader's `$ORIGIN` name the
+        // spelling's directory, which the closure walk above did not resolve against, and a hop no
+        // grant names is missing altogether. A link a directory bind brings in is left to it.
+        let mut links: Vec<MountEntry> = Vec::new();
+        for granted in config.authorizations() {
+            if granted.operation == Operation::Metadata && granted.scope == Scope::Root {
+                continue;
+            }
+            for node in link_nodes(granted) {
+                if !dedup.insert(node.clone()) {
+                    continue;
+                }
+                let enclosed = entries.iter().any(|entry| {
+                    entry.kind == MountKind::Bind
+                        && entry.target != node
+                        && node.starts_with(&entry.target)
+                        && entry.source.as_deref().is_some_and(Path::is_dir)
+                });
+                if enclosed {
+                    continue;
+                }
+                if let Some(fresh) = entries.iter().find(|entry| {
+                    matches!(entry.kind, MountKind::Fresh { .. })
+                        && !entry.writable
+                        && node.starts_with(&entry.target)
+                }) {
+                    return Err(refusal(format!(
+                        "'{}' is a link a grant's lookup traverses, and it lies under the \
+                         read-only empty directory planned at '{}', where it cannot be created",
+                        node.display(),
+                        fresh.target.display()
+                    )));
+                }
+                let text = std::fs::read_link(&node).map_err(|error| {
+                    refusal(format!("reading the link '{}': {error}", node.display()))
+                })?;
+                links.push(MountEntry {
+                    source: None,
+                    target: node,
+                    kind: MountKind::Symlink { text },
+                    writable: false,
+                    executable: false,
+                    origin: MountOrigin::Link,
+                });
+            }
+        }
+        entries.extend(links);
 
         // **A grant inside another grant's tree is established after it, whatever order the two
         // were stated in.** A nested bind sits on top of the tree that encloses it, and its own
@@ -399,7 +456,7 @@ impl MountView {
                 let entry = MountEntry {
                     source: None,
                     target: target.clone(),
-                    kind,
+                    kind: kind.clone(),
                     writable: false,
                     executable: false,
                     origin: MountOrigin::Refusal,
@@ -415,6 +472,25 @@ impl MountView {
                     entries.remove(index);
                     entries.push(entry);
                 }
+            }
+        }
+
+        // **Nothing is planned beneath a link**, whichever pass planned it. Its mountpoint would be
+        // created through the link, which can lead into a bind and so onto the host.
+        for link in entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, MountKind::Symlink { .. }))
+        {
+            if let Some(beneath) = entries
+                .iter()
+                .find(|entry| entry.target != link.target && entry.target.starts_with(&link.target))
+            {
+                return Err(refusal(format!(
+                    "'{}' lies beneath the link '{}', and a mountpoint created there would be \
+                     created wherever the link leads; name it through the link's target",
+                    beneath.target.display(),
+                    link.target.display()
+                )));
             }
         }
 
@@ -540,13 +616,19 @@ impl MountView {
             root.join(entry.target.strip_prefix("/").unwrap_or(&entry.target))
         };
 
-        match entry.kind {
+        match &entry.kind {
+            MountKind::Symlink { .. } => {
+                return Err(refusal(format!(
+                    "establishing the link '{}' is not implemented",
+                    entry.target.display()
+                )));
+            }
             MountKind::Fresh { fstype } => {
                 std::fs::create_dir_all(&target)
                     .map_err(|e| refusal(format!("creating '{}': {e}", target.display())))?;
                 // `nosuid` and `nodev` on every fresh filesystem: a setuid bit or a device node the
                 // workload created would be authority the plan never granted.
-                let mut fresh_flags = if fstype == "proc" {
+                let mut fresh_flags = if *fstype == "proc" {
                     libc::MS_NOSUID | libc::MS_NODEV
                 } else {
                     libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC
@@ -1227,6 +1309,34 @@ fn folded(path: &Path) -> PathBuf {
     result
 }
 
+/// Whether `path` is a link the view reproduces: a symbolic link on the host whose parent directory
+/// is canonical. A link reached through a linked ancestor is not one, because mirroring it in a
+/// real directory would resolve its text against the wrong place.
+fn is_link_node(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink())
+        && path
+            .parent()
+            .is_some_and(|parent| parent.canonicalize().is_ok_and(|real| real == parent))
+}
+
+/// The links a lookup of `granted` traverses that the view reproduces, in walk order.
+fn link_nodes(granted: &PathGrant) -> Vec<PathBuf> {
+    granted
+        .traversal_paths()
+        .into_iter()
+        .filter(|node| is_link_node(node))
+        .collect()
+}
+
+/// The spellings of `granted` the view binds: every reachable path that is not a link node.
+fn bound_spellings(granted: &PathGrant) -> Vec<PathBuf> {
+    granted
+        .reachable_paths()
+        .into_iter()
+        .filter(|path| !is_link_node(path))
+        .collect()
+}
+
 /// Whether `resolved` is one of the directories the loader maps code from.
 fn is_loader_directory(resolved: &Path) -> bool {
     LIBRARY_DIRECTORIES.iter().any(|directory| {
@@ -1596,7 +1706,7 @@ mod tests {
         let granted_for_execute: Vec<PathBuf> = config
             .grants_in(Operation::Exec, Scope::File)
             .into_iter()
-            .flat_map(|granted| granted.reachable_paths())
+            .flat_map(bound_spellings)
             .collect();
         for (origin, target) in &executable {
             if *origin == MountOrigin::Grant {
@@ -2488,6 +2598,208 @@ mod tests {
         );
     }
 
+    /// A virtualenv-shaped chain: `venv/bin/p → p3` (relative), `venv/bin/p3 → <prefix>/bin/p3`
+    /// (absolute, outside the venv), `<prefix>/bin/p3 → real` (relative), and `real` a copy of
+    /// `/bin/true`. Returns `(venv, route, middle, real)`.
+    fn venv_shaped_chain(directory: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = directory.canonicalize().expect("canonical fixture root");
+        let prefix_bin = root.join("prefix/bin");
+        let venv = root.join("venv");
+        let venv_bin = venv.join("bin");
+        std::fs::create_dir_all(&prefix_bin).expect("prefix");
+        std::fs::create_dir_all(&venv_bin).expect("venv");
+        let real = prefix_bin.join("real");
+        std::fs::copy("/bin/true", &real).expect("program");
+        let middle = prefix_bin.join("p3");
+        std::os::unix::fs::symlink("real", &middle).expect("hop 3");
+        std::os::unix::fs::symlink(&middle, venv_bin.join("p3")).expect("hop 2");
+        let route = venv_bin.join("p");
+        std::os::unix::fs::symlink("p3", &route).expect("hop 1");
+        (venv, route, middle, real)
+    }
+
+    /// **Each link a lookup traverses is planned as that link, and the spelling gets no bind.**
+    #[test]
+    fn a_two_link_chain_plans_each_unenclosed_hop_as_a_link() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (venv, route, middle, real) = venv_shaped_chain(directory.path());
+        let config = ContainmentConfig::new()
+            .allow(&route, Operation::Exec, Scope::File)
+            .expect("exec through the chain");
+        let entries = planned(&config);
+
+        assert_eq!(entry_for(&entries, &real).kind, MountKind::Bind);
+        for (node, text) in [
+            (route.clone(), PathBuf::from("p3")),
+            (venv.join("bin/p3"), middle.clone()),
+            (middle.clone(), PathBuf::from("real")),
+        ] {
+            let entry = entry_for(&entries, &node);
+            assert_eq!(
+                entry.kind,
+                MountKind::Symlink { text },
+                "'{}' must be the host's link",
+                node.display()
+            );
+            assert_eq!(entry.origin, MountOrigin::Link);
+            assert!(!entry.writable && !entry.executable);
+        }
+        assert_eq!(
+            entries.iter().filter(|entry| entry.target == route).count(),
+            1,
+            "the spelling is a link, never also a bind"
+        );
+    }
+
+    /// **A hop a directory bind already brings in plans nothing**: the bind carries the host's link.
+    #[test]
+    fn a_hop_inside_a_bound_tree_plans_nothing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (venv, route, middle, _) = venv_shaped_chain(directory.path());
+        let config = ContainmentConfig::new()
+            .allow(&venv, Operation::Read, Scope::Root)
+            .expect("read the venv")
+            .allow(&route, Operation::Exec, Scope::File)
+            .expect("exec through the chain");
+        let entries = planned(&config);
+
+        for inside in [route.clone(), venv.join("bin/p3")] {
+            assert!(
+                !entries.iter().any(|entry| entry.target == inside),
+                "'{}' is reached through the venv bind and must plan no entry of its own",
+                inside.display()
+            );
+        }
+        assert_eq!(
+            entry_for(&entries, &middle).kind,
+            MountKind::Symlink {
+                text: PathBuf::from("real")
+            },
+            "the hop outside the venv is the one A1 lost"
+        );
+    }
+
+    /// **Two grants that share a hop plan it once.**
+    #[test]
+    fn two_grants_sharing_a_hop_plan_it_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (venv, route, middle, _) = venv_shaped_chain(directory.path());
+        let config = ContainmentConfig::new()
+            .allow(&route, Operation::Exec, Scope::File)
+            .expect("exec p")
+            .allow(venv.join("bin/p3"), Operation::Exec, Scope::File)
+            .expect("exec p3");
+        let entries = planned(&config);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.target == middle)
+                .count(),
+            1
+        );
+    }
+
+    /// **A hop under a read-only fresh mount is refused by name**: the link cannot be made there.
+    #[test]
+    fn a_hop_under_a_read_only_fresh_mount_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_, route, middle, _) = venv_shaped_chain(directory.path());
+        let prefix_bin = middle.parent().expect("prefix bin").to_path_buf();
+        // The middle hop moves to a directory of its own, which is granted at Dir scope.
+        let alone = prefix_bin.parent().expect("prefix").join("mid");
+        std::fs::create_dir(&alone).expect("mid");
+        let moved = alone.join("p3");
+        std::os::unix::fs::symlink(prefix_bin.join("real"), &moved).expect("moved hop");
+        let venv_p3 = route.parent().expect("venv bin").join("p3");
+        std::fs::remove_file(&venv_p3).expect("unlink");
+        std::os::unix::fs::symlink(&moved, &venv_p3).expect("relink");
+
+        let config = ContainmentConfig::new()
+            .allow(&alone, Operation::Read, Scope::Dir)
+            .expect("enter mid")
+            .allow(&route, Operation::Exec, Scope::File)
+            .expect("exec through the chain");
+        let error = MountView::plan(&config).expect_err("the hop cannot be created");
+        assert!(
+            error.to_string().contains(&moved.display().to_string()),
+            "the refusal names the hop: {error}"
+        );
+    }
+
+    /// **An entry spelled beneath a mirrored link is refused**: creating its mountpoint would
+    /// follow the link, possibly into a bind and onto the host.
+    #[test]
+    fn an_entry_beneath_a_planned_link_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("root");
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        std::fs::write(real.join("f"), b"x").expect("file");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("dir link");
+
+        let config = ContainmentConfig::new()
+            .allow(&link, Operation::Read, Scope::Root)
+            .expect("read through the dir link")
+            .allow(link.join("f"), Operation::Read, Scope::File)
+            .expect("read a file under the link");
+        let error = MountView::plan(&config).expect_err("an entry beneath a link");
+        assert!(
+            error.to_string().contains(&link.display().to_string()),
+            "the refusal names the link: {error}"
+        );
+    }
+
+    /// **A refusal spelled beneath a mirrored link is refused too**: refusals are planned after the
+    /// link pass, and the rule covers every entry.
+    #[test]
+    fn a_refusal_beneath_a_planned_link_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("root");
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        std::fs::write(real.join("secret"), b"x").expect("file");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("dir link");
+
+        let config = ContainmentConfig::new()
+            .allow(&link, Operation::Read, Scope::Root)
+            .expect("read through the dir link")
+            .refuse(link.join("secret"), Scope::File)
+            .expect("refuse a file under the link");
+        let error = MountView::plan(&config).expect_err("a refusal beneath a link");
+        assert!(
+            error.to_string().contains(&link.display().to_string()),
+            "the refusal names the link: {error}"
+        );
+    }
+
+    /// **A spelling through a linked ancestor keeps its bind**: its parent is not canonical, so it
+    /// is not a link node.
+    #[test]
+    fn a_spelling_through_a_linked_ancestor_keeps_its_bind() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("root");
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        std::fs::write(real.join("f"), b"x").expect("file");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("dir link");
+
+        let config = ContainmentConfig::new()
+            .allow(link.join("f"), Operation::Read, Scope::File)
+            .expect("read through a linked ancestor");
+        let entries = planned(&config);
+        assert_eq!(entry_for(&entries, &link.join("f")).kind, MountKind::Bind);
+        assert_eq!(entry_for(&entries, &real.join("f")).kind, MountKind::Bind);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry.kind, MountKind::Symlink { .. })),
+            "no link node in this chain"
+        );
+    }
+
     /// A grant through a symlink is reachable under BOTH names.
     #[test]
     fn a_grant_through_a_symlink_is_reachable_under_both_names() {
@@ -2513,9 +2825,9 @@ mod tests {
 
         let alias_entry = entry_for(&entries, &link);
         assert_eq!(
-            alias_entry.source.as_deref(),
-            Some(canonical.as_path()),
-            "the caller's spelling must reach the SAME object, not a second one"
+            alias_entry.kind,
+            MountKind::Symlink { text: real.clone() },
+            "the caller's spelling must be the host's link to the SAME object, not a second bind"
         );
     }
 
