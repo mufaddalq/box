@@ -96,7 +96,8 @@ A kernel refusal is not a decision. On Linux a call the syscall filter refuses a
 them (`strands.box.containment.arguments`, such as `family=AF_PACKET type=SOCK_RAW`), and the process.
 The box records the first refusal of a kind at once and counts repeats for ten seconds, so one record
 can stand for many calls: `strands.box.containment.suppressed` says how many more. A box tracks at
-most 256 kinds; past that, one `refusals_unobserved` control record says so. When the host cannot
+most 256 kinds; past that, one `refusals_unobserved` control record says so, and later refusals are
+counted under their call alone, so each new call still gets a record. When the host cannot
 pass the box the kernel's notifications, the refusals still happen and one `refusals_unobserved`
 record names the reason. `refusals_unobserved` is a control record, so it reaches a target through
 `trace`, not `kernel`: a target that names `kernel` and not `trace` does not learn that refusals went

@@ -1925,7 +1925,10 @@ reach its child (Yama scope 0 or 1).
 
 Each refused call now costs a round trip to the box, about 60 µs measured on arm64 against about a
 microsecond for the filter alone; a call the filter permits costs nothing more. A workload chooses
-how often it is refused, so records are limited per (executable, call, arguments): the first at once, repeats counted for ten seconds, at most 256 keys a box. Every record
-stands for one call plus its `suppressed` count. Refusals the view or the network namespace make
+how often it is refused, so records are limited per (executable, call, arguments): the first at
+once, repeats counted for ten seconds, at most 256 keys a box. Past the cap a new key is counted under
+its call alone, with every call number from 1024 up in one bucket, so arguments a workload picks
+cannot hide a later kind of call and the coarse keys stay bounded. Every record stands for one call
+plus its `suppressed` count. Refusals the view or the network namespace make
 (`ENOENT`, `EROFS`, `ENETUNREACH`) have no hook short of tracing every call and stay unobserved, and
 macOS reads no sandbox reports yet.
