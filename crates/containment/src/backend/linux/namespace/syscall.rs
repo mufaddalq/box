@@ -761,7 +761,6 @@ pub(crate) struct SyscallFilters {
     /// `permit` then `restrictions` as one program, every `EPERM` a notification. One program,
     /// because a task's filter chain takes one listener and an `ERRNO` from any filter hides a
     /// notification from another.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) observed: BpfProgram,
 }
 
