@@ -57,6 +57,7 @@ A target names a **set**. No signal contains another, and there is no ordering.
 | `agent_logs` | one log record the agent's own instrumentation exported |
 | `agent_metrics` | one metric the agent's own instrumentation exported |
 | `control_plane` | one change to the authority this box holds |
+| `kernel_refused` | one call the kernel refused beneath policy (Linux seccomp), queued with `Collector::refusal` |
 
 **A target naming none receives every one of the six.** An empty set is refused.
 
