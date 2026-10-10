@@ -41,7 +41,11 @@ Many file reads never do:
 - **A tool's or a local MCP server's file operations:** inside its sandbox, they raise no policy
   decision.
 
-So a history rule can't account for a read that took one of those routes. The
+So a history rule can't account for a read that took one of those routes. The kernel's own refusals
+are recorded only in part: on Linux a call the syscall filter refuses leaves a `kernel_refused`
+record, but a path absent from a view, a write to a read-only mount, and an unroutable connection
+leave none, macOS records none yet, and a host whose ptrace policy refuses a parent its child (Yama
+scope 2 or 3) or whose kernel predates `pidfd_getfd` records none either. The
 [policy page](policy.md#durable-history) explains why policy history isn't a complete audit record.
 
 The other direction matters too. Strands Shell and Monty run outside every box, so a broad

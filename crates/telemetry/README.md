@@ -61,10 +61,10 @@ A target names a **set**. No signal contains another, and there is no ordering.
 
 **A target naming none receives every one of the six.** An empty set is refused.
 
-These six are this crate's own vocabulary and the spelling a record carries. They are not what an
-operator writes: `box.toml` takes `include`, whose words are `deny`, `permit`, `trace`, `logs`, and
-`metrics`, and the box expands each word into this set. `trace` names both `agent_trace` and
-`control_plane`.
+These seven are this crate's own vocabulary and the spelling a record carries. They are not what an
+operator writes: `box.toml` takes `include`, whose words are `deny`, `permit`, `trace`, `kernel`,
+`logs`, and `metrics`, and the box expands each word into this set. `trace` names both `agent_trace`
+and `control_plane`; `kernel` names `kernel_refused`.
 
 ## What a record carries
 
