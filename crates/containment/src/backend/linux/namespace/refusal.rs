@@ -272,8 +272,6 @@ fn at_flags(value: u64) -> String {
 }
 
 /// The errno names an install failure can carry, for the control record and the stderr line.
-// Used by the install path (next commit).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn errno_name(errno: i32) -> &'static str {
     match errno {
         libc::EBUSY => "EBUSY",
@@ -289,8 +287,6 @@ pub(crate) fn errno_name(errno: i32) -> &'static str {
 }
 
 /// Hand the listener to the box. The caller closes its own copy right after.
-// Used by the install path (next commit).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn send_observed(
     control: &UnixStream,
     listener: &OwnedFd,
@@ -299,8 +295,6 @@ pub(crate) fn send_observed(
 }
 
 /// Tell the box this launch fell back, and why.
-// Used by the install path (next commit).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn send_unobserved(control: &UnixStream, errno: i32) -> Result<(), ContainmentError> {
     use std::io::Write as _;
     let mut message = [UNOBSERVED, 0, 0, 0, 0];
@@ -311,6 +305,200 @@ pub(crate) fn send_unobserved(control: &UnixStream, errno: i32) -> Result<(), Co
             backend: super::MECHANISM.to_string(),
             reason: format!("telling the box seccomp refusals are not observed: {source}"),
         })
+}
+
+/// The sync protocol between PID 1 and the workload, five bytes a message (a tag and an `i32`):
+///
+/// 0. workload → PID 1: `R` (ready: its capabilities are dropped, so PID 1, which holds none,
+///    passes the kernel's capability-subset check on it).
+/// 1. PID 1 → workload: `G` (go: PID 1 just copied a descriptor out of the workload, so it can copy
+///    the listener) or `N errno` (it cannot; install the refusing pair).
+/// 2. workload → PID 1, after `G`: `L fd` (the observed filter is installed, listener at `fd`) or
+///    `U errno` (the kernel refused the observed install; the refusing pair is installed).
+/// 3. PID 1 → workload, after `L`: `Y` (the box has the listener) or `N errno`.
+const READY: u8 = b'R';
+const GO: u8 = b'G';
+const LISTENING: u8 = b'L';
+const FORWARDED: u8 = b'Y';
+const NOT_FORWARDED: u8 = b'N';
+
+/// The socket pair PID 1 and the workload talk over, `(PID 1's end, the workload's end)`.
+/// Created by PID 1 before it forks the workload; both ends are close-on-exec.
+pub(crate) fn sync_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut pair = [0 as libc::c_int; 2];
+    // SAFETY: socketpair writes two descriptors into `pair`.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors are fresh and owned here.
+    Ok(unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) })
+}
+
+/// Write one five-byte message: a tag and a native-endian `i32`. Uses `write` only, which the
+/// workload's filter permits.
+fn write_message(socket: &OwnedFd, tag: u8, value: i32) -> bool {
+    let mut message = [tag, 0, 0, 0, 0];
+    message[1..].copy_from_slice(&value.to_ne_bytes());
+    // SAFETY: writing five bytes from the stack.
+    let written =
+        unsafe { libc::write(socket.as_raw_fd(), message.as_ptr().cast(), message.len()) };
+    written == message.len() as isize
+}
+
+/// Read one five-byte message, or `None` on EOF or error. Uses `read` only.
+fn read_message(socket: &OwnedFd) -> Option<(u8, i32)> {
+    let mut message = [0u8; 5];
+    let mut filled = 0;
+    while filled < message.len() {
+        // SAFETY: reading into the unfilled tail of a stack buffer.
+        let read = unsafe {
+            libc::read(
+                socket.as_raw_fd(),
+                message[filled..].as_mut_ptr().cast(),
+                message.len() - filled,
+            )
+        };
+        if read <= 0 {
+            if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            return None;
+        }
+        filled += read as usize;
+    }
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&message[1..]);
+    Some((message[0], i32::from_ne_bytes(value)))
+}
+
+/// What the workload should install, as PID 1 answered step 1.
+pub(crate) enum Plan {
+    /// Install the observed filter and announce its listener.
+    Observe,
+    /// Install the refusing pair only; PID 1 has already told the box why.
+    Refuse,
+    /// PID 1 is gone or broke the protocol: refuse the apply.
+    Broken,
+}
+
+/// The workload's steps 0 and 1: say it is ready, then wait for PID 1's check. Call it after the
+/// workload drops its capabilities.
+pub(crate) fn await_plan(sync: &OwnedFd) -> Plan {
+    if !write_message(sync, READY, 0) {
+        return Plan::Broken;
+    }
+    match read_message(sync) {
+        Some((GO, _)) => Plan::Observe,
+        Some((NOT_FORWARDED, _)) => Plan::Refuse,
+        _ => Plan::Broken,
+    }
+}
+
+/// The workload's step 2 with a listener: name it, and wait for PID 1's answer. `true` only when
+/// the box now holds the listener.
+pub(crate) fn announce_listener(sync: &OwnedFd, listener: &OwnedFd) -> bool {
+    if !write_message(sync, LISTENING, listener.as_raw_fd()) {
+        return false;
+    }
+    matches!(read_message(sync), Some((FORWARDED, _)))
+}
+
+/// The workload's step 2 when the kernel refused the observed install. Best effort: the refusing
+/// filters are already installed.
+pub(crate) fn announce_unobserved(sync: &OwnedFd, errno: i32) {
+    let _ = write_message(sync, UNOBSERVED, errno);
+}
+
+/// PID 1's half. `workload_sync` is the workload's end of `sync` by number, which PID 1 copies out
+/// of the workload first: the same operation, on a descriptor that exists now, is the check that
+/// it will be able to copy the listener. Never answers a notification.
+pub(crate) fn forward_listener(
+    workload: libc::pid_t,
+    sync: &OwnedFd,
+    workload_sync: libc::c_int,
+    handoff: libc::c_int,
+) {
+    // SAFETY: PID 1 owns this descriptor and closes it after this call; ManuallyDrop leaves it open.
+    let control = std::mem::ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(handoff) });
+    if !matches!(read_message(sync), Some((READY, _))) {
+        return;
+    }
+    if let Err(errno) = copy_descriptor(workload, workload_sync) {
+        let _ = write_message(sync, NOT_FORWARDED, errno);
+        warn_unobserved(errno);
+        let _ = send_unobserved(&control, errno);
+        return;
+    }
+    if !write_message(sync, GO, 0) {
+        return;
+    }
+    match read_message(sync) {
+        Some((LISTENING, number)) => match copy_descriptor(workload, number).and_then(|copy| {
+            // A copy that cannot reach the box is closed here, unread.
+            send_observed(&control, &copy).map_err(|_| libc::EPIPE)
+        }) {
+            Ok(()) => {
+                let _ = write_message(sync, FORWARDED, 0);
+            }
+            Err(errno) => {
+                // The workload refuses its apply on this answer: its filter is installed and can
+                // no longer be stacked over.
+                eprintln!(
+                    "strands-box: namespace reaper could not hand the seccomp listener to the box: {}",
+                    errno_name(errno)
+                );
+                let _ = write_message(sync, NOT_FORWARDED, errno);
+            }
+        },
+        Some((UNOBSERVED, errno)) => {
+            warn_unobserved(errno);
+            let _ = send_unobserved(&control, errno);
+        }
+        // The workload exited, or wrote something this protocol does not have: nothing to forward.
+        _ => {}
+    }
+}
+
+/// The one stderr line a fallback writes.
+fn warn_unobserved(errno: i32) {
+    eprintln!(
+        "strands-box-contain-trampoline: warning: seccomp refusals are not observed: {}",
+        errno_name(errno)
+    );
+}
+
+/// A copy of descriptor `number` in process `pid`, through a pidfd. PID 1 is the workload's parent
+/// in the same user namespace, so the kernel's ptrace-access check passes unless the host's
+/// policy (Yama scope 2 or higher) refuses it.
+fn copy_descriptor(pid: libc::pid_t, number: i32) -> Result<OwnedFd, i32> {
+    let errno = || {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL)
+    };
+    // SAFETY: pidfd_open with a pid and no flags.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if pidfd < 0 {
+        return Err(errno());
+    }
+    // SAFETY: the kernel returned a new descriptor this process owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+    // SAFETY: pidfd_getfd with an owned pidfd, a descriptor number, and no flags.
+    let copy = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), number, 0) };
+    if copy < 0 {
+        return Err(errno());
+    }
+    // SAFETY: the kernel returned a new close-on-exec descriptor this process owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(copy as i32) })
 }
 
 /// What the workload handed over on `control` after the netns listeners: the listener, the
