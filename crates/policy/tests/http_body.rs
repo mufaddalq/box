@@ -25,9 +25,10 @@ const SAFE: &str = r#"
 permit (principal, action == Box::Action::"http:request", resource);
 @id("wiki_scope")
 forbid (principal, action == wiki::Action::"http_body", resource)
-when   { context.input.method == "POST" && context.input.path == "/rest/search" }
-unless { context.input.body_json && context.input has spaces &&
-         ["eng", "docs"].containsAll(context.input.spaces) };
+unless { context.input.method == "GET" ||
+         (context.input.method == "POST" && context.input.path == "/upload") ||
+         (context.input.body_json && context.input has spaces &&
+          ["eng", "docs"].containsAll(context.input.spaces)) };
 "#;
 
 fn source(text: &str) -> Vec<Policy> {
@@ -276,4 +277,15 @@ fn a_mistyped_route_rule_is_refused_at_open_not_set_aside() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn the_documented_form_scopes_a_respelled_path() {
+    let (_d, e) = engine(SAFE, vec![wiki()]);
+    for path in ["/rest/search/", "/REST/search", "/upload/"] {
+        assert!(
+            !refine(&e, path, br#"{"filter":{"spaces":["secret"]}}"#, false).is_allow(),
+            "{path}"
+        );
+    }
 }

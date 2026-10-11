@@ -40,11 +40,12 @@ fn safe_policy(port: u16) -> String {
 when {{ context.input.host == "{HOST}" && context.input.port == {port} }};
 permit(principal, action == Box::Action::"http:request", resource)
 when {{ context.input.host == "{HOST}" && context.input.port == {port} }};
-@id("wiki_search_scope")
+@id("wiki_body_scope")
 forbid (principal, action == wiki::Action::"http_body", resource)
-when   {{ context.input.method == "POST" && context.input.path == "/rest/search" }}
-unless {{ context.input.body_json && context.input has spaces &&
-         ["eng", "docs"].containsAll(context.input.spaces) }};"#
+unless {{ context.input.method == "GET" ||
+         (context.input.method == "POST" && context.input.path == "/upload") ||
+         (context.input.body_json && context.input has spaces &&
+          ["eng", "docs"].containsAll(context.input.spaces)) }};"#
     )
 }
 
@@ -250,4 +251,24 @@ fn a_route_without_body_fields_is_unchanged() {
         plain.status("/rest/search", &[], br#"{"filter":{"spaces":["secret"]}}"#),
         200
     );
+}
+
+#[test]
+fn a_respelled_path_is_still_scoped() {
+    // The documented form scopes every request except the named exemptions, so a spelling the
+    // rule did not foresee is refused rather than waved through.
+    let wiki = body_box(true);
+    for path in [
+        "/rest/search/",
+        "/rest//search",
+        "/REST/search",
+        "/rest/search;x=1",
+    ] {
+        assert_eq!(
+            wiki.status(path, &[], br#"{"filter":{"spaces":["secret"]}}"#),
+            403,
+            "{path}"
+        );
+    }
+    assert_eq!(wiki.upstream.request_count(), 0);
 }

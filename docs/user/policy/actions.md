@@ -161,19 +161,25 @@ integer in the 64-bit range, so `1.0` and `1e3` leave the field absent. A `set<s
 `set<long>` field is set from an array whose every element has the element type, or from one value
 of that type.
 
-Write the rule so that an unparseable body is refused:
+Write the rule as a `forbid` on every request to the route, with an `unless` that names each
+exemption and the allowed body:
 
 ```text
-@id("wiki_search_scope")
+@id("wiki_body_scope")
 forbid (principal, action == wiki::Action::"http_body", resource)
-when   { context.input.method == "POST" && context.input.path == "/rest/search" }
-unless { context.input.body_json && context.input has spaces &&
-         ["eng", "docs"].containsAll(context.input.spaces) };
+unless { context.input.method == "GET" ||
+         (context.input.method == "POST" && context.input.path == "/upload") ||
+         (context.input.body_json && context.input has spaces &&
+          ["eng", "docs"].containsAll(context.input.spaces)) };
 ```
 
-A rule of the form `when { context.input has spaces && !["eng", "docs"].containsAll(context.input.spaces) }`
-matches nothing when the body does not parse, because the field is absent. The request then rides
-the `http:request` permit with its scope unchecked.
+This rule refuses a body that does not parse, and a request on any path it does not exempt. The
+gateway keeps a trailing `/`, a repeated `/`, a `;` parameter, and letter case in `path`, so a rule
+that scopes one spelling, such as `when { context.input.path == "/rest/search" }`, misses
+`/rest/search/` and lets that request ride the `http:request` permit. A rule of the form
+`when { context.input has spaces && !["eng", "docs"].containsAll(context.input.spaces) }` matches
+nothing on a body that does not parse, because the field is absent, so that request also rides the
+permit.
 
 ## Shell
 

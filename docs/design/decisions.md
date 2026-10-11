@@ -1579,8 +1579,11 @@ rejected, because the authored policy is the only authorizer.
 The action records `::request` only, with the declared field values, because the history refuses a
 changed event schema; the reply's status stays on `http:request`. A rule that guards only on
 `has <field>` matches nothing on an unparseable body and lets the request ride the coarse permit.
-`the_documented_form_refuses_an_unparseable_body` and `a_duplicate_key_smuggle_is_refused` pin
-the fail-closed form.
+The documented form forbids every request to the route and names its exemptions in `unless`,
+because the canonical path keeps a trailing `/`, `//`, `;params`, and case, so a rule that matches
+one path spelling misses another. `the_documented_form_refuses_an_unparseable_body`,
+`a_duplicate_key_smuggle_is_refused`, and `a_respelled_path_is_still_scoped` pin the fail-closed
+form.
 
 <a id="remote-tool-schemas-are-discovered-at-runtime-in-memory"></a>
 ### The box discovers a remote MCP server's tool schemas at runtime, in memory

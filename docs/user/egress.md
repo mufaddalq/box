@@ -106,8 +106,8 @@ name is a letter or `_`, then letters, digits, or `_`. It can't be a field the a
 (`host`, `port`, `method`, `path`, `body_bytes`, `intercepted`, or `body_json`) or a policy keyword.
 
 [The `http_body` action](./policy/actions.md#http-body) lists its fields, how the body is parsed,
-and the rule form that refuses a body the gateway can't parse. A request on another path of the
-route, such as an upload, still passes that rule.
+and the rule form that refuses a body the gateway can't parse. A request on the route that carries
+no scoped body, such as an upload, passes through an exemption that rule names.
 
 ## Credential sources
 
