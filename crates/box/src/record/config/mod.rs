@@ -42,8 +42,8 @@ use crate::error::{BoxError, ConfigError};
 #[cfg(test)]
 use self::egress::routes_for;
 use self::egress::{
-    EgressEntry, EgressRoute, Protocol, host_of, routes_for_and_remote, validate_egress,
-    validate_egress_and_remote,
+    EgressEntry, EgressRoute, Protocol, body_route_patterns, body_routes, host_of,
+    routes_for_and_remote, validate_egress, validate_egress_and_remote,
 };
 #[cfg(test)]
 use self::env::{LOADER_HOOK_PREFIXES, LOADER_HOOKS};
@@ -84,6 +84,12 @@ pub(super) const INJECT_ALWAYS: &str = "always";
 pub(crate) fn read_mcp_servers(path: &Path) -> Result<Vec<mcp::McpServer>, BoxError> {
     let file = ConfigFile::read(path)?;
     mcp::from_entries(&file.mcp)
+}
+
+/// Read the `[egress.<name>] body.fields` routes from one workspace config.
+pub(crate) fn read_body_routes(path: &Path) -> Result<Vec<policy::HttpBodyRoute>, BoxError> {
+    let file = ConfigFile::read(path)?;
+    Ok(body_routes(&file.egress)?)
 }
 
 /// A remote MCP server: an `[egress.<name>]` entry speaking `mcp`, resolved to a discovery URL.
@@ -386,6 +392,7 @@ impl RunContract {
         let (policy, policy_source) = read_authored_policy(
             policy_path.as_deref(),
             mcp_servers.is_empty(),
+            &body_routes(&self.file.egress)?,
             &policy_operator()?,
         )?;
         if let Some(source) = &policy_source
@@ -430,6 +437,7 @@ impl RunContract {
                         destinations: remote.destinations,
                         protocol: Protocol::Mcp,
                         secret: remote.secret,
+                        body: None,
                     },
                 )
             })
@@ -540,7 +548,8 @@ pub(crate) struct Record {
     pub(crate) telemetry: BTreeMap<String, telemetry::TelemetryEntry>,
 }
 
-/// The record format this build writes and accepts: version 21 adds `network` to each
+/// The record format this build writes and accepts: version 22 adds `body.fields` to
+/// `[egress.<name>]`. Version 21 adds `network` to each
 /// `[tool.<name>]`, and stores a stdio MCP server's network in its spec's `network`, where version
 /// 20 kept a separate `native_egress` flag on `ContainedMcp`. Version 20 names a secret's injection mode
 /// `secret.inject`, taking `phantom` or `always`, where version 19 took `secret.phantom` with
@@ -550,7 +559,7 @@ pub(crate) struct Record {
 /// stdio server is now contained), so a v16 record that predates it is refused with a version
 /// mismatch rather than silently losing containment. Version 16 dropped the credsd `secret.type`
 /// key.
-pub(crate) const RECORD_VERSION: u32 = 21;
+pub(crate) const RECORD_VERSION: u32 = 22;
 
 /// A key an earlier build read, and what replaced it.
 struct RemovedKey {
@@ -815,6 +824,19 @@ impl Record {
         routes_for_and_remote(&self.egress, &self.remote_mcp)
     }
 
+    /// The `[egress.<name>]` entries that declare `body.fields`, as policy routes.
+    pub(crate) fn body_routes(&self) -> Result<Vec<policy::HttpBodyRoute>, BoxError> {
+        Ok(body_routes(&self.egress)?)
+    }
+
+    /// The gateway's body-route table: one `(pattern, route name)` per destination of each entry
+    /// that declares `body.fields`.
+    pub(crate) fn body_route_patterns(
+        &self,
+    ) -> Result<Vec<(credentials::DestinationPattern, String)>, BoxError> {
+        Ok(body_route_patterns(&self.egress)?)
+    }
+
     /// The remote MCP servers this box declares, as `(host, name)` pairs — one per destination of
     /// each `[mcp.<name>] type = "http"` entry. The gateway matches a connecting host against these
     /// to decide whether to parse the frame and raise `mcp:call`; the name is the table key.
@@ -876,9 +898,13 @@ pub(crate) fn policy_operator() -> Result<policy::Operator, BoxError> {
 }
 
 /// Read the authored policy text, keeping its origin for diagnostics and audit.
+///
+/// With no MCP server the schema is complete at load, so the text is validated against the
+/// built-in actions and each body route's `http_body` fragment.
 fn read_authored_policy(
     path: Option<&Path>,
     validate_complete_schema: bool,
+    body_routes: &[policy::HttpBodyRoute],
     operator: &policy::Operator,
 ) -> Result<(Option<Policy>, Option<AuthoritySource>), BoxError> {
     let Some(path) = path else {
@@ -890,7 +916,11 @@ fn read_authored_policy(
         text,
     };
     let validation = if validate_complete_schema {
-        PolicyEngine::validate(operator, std::slice::from_ref(&source))
+        PolicyEngine::validate_with_body_routes(
+            operator,
+            std::slice::from_ref(&source),
+            body_routes,
+        )
     } else {
         PolicyEngine::validate_staged(std::slice::from_ref(&source))
     };
@@ -1457,6 +1487,7 @@ mod tests {
                         inject: None,
                         phantom_prefix: None,
                     }),
+                    body: None,
                 },
             )]),
         );
@@ -1470,6 +1501,55 @@ mod tests {
             .expect("the stored authority rebuilds");
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].host(), "api.stripe.com");
+    }
+
+    #[test]
+    fn a_record_with_body_fields_round_trips_at_version_22() {
+        let variable = present_variable();
+        let stored = record(
+            None,
+            BTreeMap::from([(
+                "wiki".to_string(),
+                EgressEntry {
+                    destinations: vec!["wiki.example.com/rest".to_string()],
+                    protocol: Protocol::Http,
+                    secret: Some(EgressSecret {
+                        reference: format!("env://{variable}"),
+                        header: None,
+                        prefix: None,
+                        placement: None,
+                        param: None,
+                        inject: None,
+                        phantom_prefix: None,
+                    }),
+                    body: Some(egress::EgressBody {
+                        fields: BTreeMap::from([(
+                            "spaces".to_string(),
+                            egress::EgressBodyField {
+                                pointer: "/filter/spaces".to_string(),
+                                kind: "set<string>".to_string(),
+                            },
+                        )]),
+                    }),
+                },
+            )]),
+        );
+        assert_eq!(stored.version, 22);
+
+        let parsed = Record::parse(&stored.to_toml().unwrap(), Path::new("box.toml")).unwrap();
+
+        assert_eq!(parsed, stored);
+        let routes = parsed.body_routes().expect("routes rebuild");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].route(), "wiki");
+        let patterns = parsed.body_route_patterns().expect("patterns rebuild");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].1, "wiki");
+        assert!(patterns[0].0.matches(&credentials::Destination {
+            host: "wiki.example.com",
+            port: 443,
+            path: "/rest/search",
+        }));
     }
 
     #[test]
@@ -1881,6 +1961,7 @@ env = {}
                             inject: None,
                             phantom_prefix: None,
                         }),
+                        body: None,
                     },
                 ),
                 (
@@ -1897,6 +1978,7 @@ env = {}
                             inject: None,
                             phantom_prefix: None,
                         }),
+                        body: None,
                     },
                 ),
             ]),
@@ -1928,6 +2010,7 @@ env = {}
                         inject: None,
                         phantom_prefix: None,
                     }),
+                    body: None,
                 },
             )]),
         );
@@ -1982,6 +2065,7 @@ env = {}
                     inject: None,
                     phantom_prefix: None,
                 }),
+                body: None,
             },
         );
         let mut git = self::agent(&["git"]);
@@ -2190,6 +2274,64 @@ env = {}
                     .into_request(&root)
                     .is_err(),
                 "configuration without MCP servers must keep strict schema validation"
+            );
+        });
+    }
+
+    #[test]
+    fn a_policy_naming_a_declared_route_validates_with_no_mcp_servers() {
+        let variable = present_variable();
+        let directory = tempfile::tempdir().expect("configuration directory");
+        crate::test_support::with_operator_home(directory.path(), || {
+            let workspace = directory.path().join("workspace");
+            let box_directory = directory.path().join("box");
+            std::fs::create_dir(&workspace).expect("workspace");
+            std::fs::create_dir(&box_directory).expect("box directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&box_directory, std::fs::Permissions::from_mode(0o700))
+                    .expect("private box directory");
+            }
+            std::fs::write(
+                directory.path().join("policy.dw"),
+                "forbid (principal, action == wiki::Action::\"http_body\", resource);\n",
+            )
+            .expect("write policy");
+            let config_path = directory.path().join("box.toml");
+            let config = |body: &str| {
+                format!(
+                    "name = \"codex\"\nbox_dir = {:?}\npolicy = \"policy.dw\"\n\
+                     [egress.wiki]\ndestinations = [\"wiki.example.com\"]\n\
+                     secret.ref = \"env://{variable}\"\n{body}",
+                    box_directory.display().to_string()
+                )
+            };
+            let mut root = crate::record::layout::BoxRoot::open_directory(&box_directory)
+                .expect("box directory opens");
+            root.initialize().expect("box layout initializes");
+            let _lock = crate::run::lock::Lock::try_acquire(&root.lock())
+                .expect("lock opens")
+                .expect("box is free");
+            root.settle_identity().expect("identity settles");
+
+            std::fs::write(
+                &config_path,
+                config("body.fields.spaces = { pointer = \"/filter/spaces\", type = \"set<string>\" }\n"),
+            )
+            .expect("write configuration");
+            RunContract::read(&config_path, &workspace)
+                .expect("run contract loads")
+                .into_request(&root)
+                .expect("the declared route's action is in the complete schema");
+
+            std::fs::write(&config_path, config("")).expect("write configuration");
+            assert!(
+                RunContract::read(&config_path, &workspace)
+                    .expect("run contract loads")
+                    .into_request(&root)
+                    .is_err(),
+                "without body.fields the route's action is unknown"
             );
         });
     }

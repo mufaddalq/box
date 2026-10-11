@@ -112,7 +112,8 @@ async fn hosted(
     let sources: Vec<Policy> = locked.policy.into_iter().collect();
     let subject = policy_subject(&sources);
     let operator = crate::record::config::policy_operator()?;
-    let policy = match HostedBox::prepare_policy(&locked.root, &operator, sources) {
+    let body_routes = locked.record.body_routes()?;
+    let policy = match HostedBox::prepare_policy(&locked.root, &operator, sources, body_routes) {
         Ok(engine) => {
             for warning in engine.warnings() {
                 eprintln!("strands-box: warning: {warning}");

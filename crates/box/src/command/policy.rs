@@ -4,11 +4,13 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
-use policy::{compose_action_schema, event_schema_source, generate_mcp_schema};
+use policy::{
+    compose_action_schema, event_schema_source, generate_http_body_schema, generate_mcp_schema,
+};
 
 use crate::error::{BoxError, McpSchemaError};
 use crate::record::config::egress::EgressSecret;
-use crate::record::config::{read_mcp_servers, read_remote_mcp_servers};
+use crate::record::config::{read_body_routes, read_mcp_servers, read_remote_mcp_servers};
 use crate::record::layout::operator_home_directory;
 
 const ACTION_SCHEMA_FILE: &str = "actions.cedarschema";
@@ -22,6 +24,8 @@ pub(crate) async fn generate_schema(
         std::env::current_dir().map_err(|source| McpSchemaError::WorkingDirectory { source })?;
     let config = working.join(config);
     let servers = read_mcp_servers(&config)?;
+    // Read before any discovery, so a refused declaration costs no server start.
+    let body_routes = read_body_routes(&config)?;
     let home = operator_home_directory()?;
 
     let mut generated = Vec::with_capacity(servers.len());
@@ -54,6 +58,12 @@ pub(crate) async fn generate_schema(
         let schema = generate_mcp_schema(&server.name, &response.to_string())
             .map_err(McpSchemaError::from)?;
         generated.push((server.name.clone(), schema));
+    }
+
+    // A body route's `http_body` fragment comes from the config alone; composing it beside the
+    // servers' fragments refuses a namespace a route shares with a server.
+    for route in &body_routes {
+        generated.push((route.route().to_string(), generate_http_body_schema(route)));
     }
 
     let schemas = generated

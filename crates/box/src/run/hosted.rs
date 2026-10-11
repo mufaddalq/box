@@ -486,12 +486,19 @@ impl HostedBox {
         root: &BoxRoot,
         operator: &policy::Operator,
         sources: Vec<policy::Policy>,
+        body_routes: Vec<policy::HttpBodyRoute>,
     ) -> Result<Arc<PolicyEngine>, BoxError> {
         let database_path = root.dogwood_database();
         let database = root.open_dogwood_database()?;
         Ok(Arc::new(
-            PolicyEngine::open_staged_file(operator, sources, database, database_path)?
-                .observed_by(Arc::new(telemetry::PolicyDecisionObserver)),
+            PolicyEngine::open_staged_file_with_body_routes(
+                operator,
+                sources,
+                body_routes,
+                database,
+                database_path,
+            )?
+            .observed_by(Arc::new(telemetry::PolicyDecisionObserver)),
         ))
     }
 
@@ -581,6 +588,8 @@ impl HostedBox {
                 credential_env: projection.phantom_environment,
                 // The servers the gateway frames are the servers the policy door tracks.
                 mcp_servers: remote_mcp_servers,
+                // The routes the gateway reads a body on are the routes the policy decides.
+                body_routes: record.body_route_patterns()?,
                 ..MitmConfig::default()
             },
             capabilities.build(),
@@ -700,7 +709,7 @@ impl HostedBox {
                 text,
             });
         }
-        Self::prepare_policy(root, &policy::Operator::unanchored(), sources)
+        Self::prepare_policy(root, &policy::Operator::unanchored(), sources, Vec::new())
     }
 
     /// What this run's boundary reads.
@@ -861,6 +870,7 @@ permit (principal, action == Box::Action::"shell:spawn", resource);
 permit (principal, action == alpha::Action::"read", resource);"#
                     .to_string(),
             }],
+            record.body_routes().expect("routes"),
         )
         .expect("the staged authority opens");
         let owned = Lock::try_acquire(&root.lock())
@@ -923,8 +933,13 @@ permit (principal, action == alpha::Action::"read", resource);"#
             .tool
             .insert("u".to_string(), tool(home.join("absent")));
         let collector = collector(operator.path());
-        let policy = HostedBox::prepare_policy(&root, &policy::Operator::unanchored(), Vec::new())
-            .expect("an empty authority opens");
+        let policy = HostedBox::prepare_policy(
+            &root,
+            &policy::Operator::unanchored(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("an empty authority opens");
         let owned = Lock::try_acquire(&root.lock())
             .expect("the lock opens")
             .expect("the lock is free");

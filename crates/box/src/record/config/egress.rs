@@ -123,6 +123,31 @@ pub(super) fn routes_for_and_remote(
     routes_for_pairs(&union_pairs(egress, remote_mcp))
 }
 
+/// The policy routes of the operator's `[egress.*]` entries that declare `body.fields`.
+pub(super) fn body_routes(
+    entries: &BTreeMap<String, EgressEntry>,
+) -> Result<Vec<policy::HttpBodyRoute>, ConfigError> {
+    entries
+        .iter()
+        .filter_map(|(name, entry)| entry.body_route(name).transpose())
+        .collect()
+}
+
+/// One `(pattern, route name)` pair per destination of each entry that declares `body.fields`,
+/// parsed exactly as its credential route is, so the gateway reads a body where the credential
+/// attaches.
+pub(super) fn body_route_patterns(
+    entries: &BTreeMap<String, EgressEntry>,
+) -> Result<Vec<(DestinationPattern, String)>, ConfigError> {
+    let mut patterns = Vec::new();
+    for (name, entry) in entries.iter().filter(|(_, entry)| entry.body.is_some()) {
+        for destination in &entry.destinations {
+            patterns.push((entry.pattern(destination)?, name.clone()));
+        }
+    }
+    Ok(patterns)
+}
+
 /// Validate the operator's `[egress.*]` entries alone.
 pub(super) fn validate_egress(entries: &BTreeMap<String, EgressEntry>) -> Result<(), ConfigError> {
     validate_pairs(&as_pairs(entries))
@@ -150,6 +175,16 @@ fn validate_pairs(entries: &[(Origin, &str, &EgressEntry)]) -> Result<(), Config
     let mut hosts: BTreeMap<String, (Origin, &str, Protocol)> = BTreeMap::new();
     for &(origin, name, entry) in entries {
         entry.validate()?;
+        if entry.body.is_some() && entry.protocol == Protocol::Mcp {
+            return Err(ConfigError::Credential {
+                host: entry.destinations.first().cloned().unwrap_or_default(),
+                reason: format!(
+                    "`[egress.{name}] body.fields`: a remote MCP server takes no body.fields; its \
+                     tool calls already have typed per-tool actions"
+                ),
+            });
+        }
+        entry.body_route(name)?;
         // A remote MCP server's name is its `context.input.server`, which a rule reads to gate its
         // tool calls. It must be present and nameable: empty leaves it nameless, and a control
         // character (a newline) could break out of a policy comment and inject a rule.
@@ -349,6 +384,31 @@ pub(crate) struct EgressEntry {
     /// Which secret to attach, and where it lands. Absent for a target that needs none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) secret: Option<EgressSecret>,
+
+    /// The request-body fields a rule reads through the route's `<ns>::Action::"http_body"`
+    /// (docs/design/decisions.md#a-body-condition-is-a-declared-refinement). Absent for a route
+    /// that inspects no body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) body: Option<EgressBody>,
+}
+
+/// `[egress.<name>] body`: what the gateway reads out of a request body on this route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EgressBody {
+    /// Each declared field, keyed by the name a rule reads as `context.input.<name>`.
+    pub(crate) fields: BTreeMap<String, EgressBodyField>,
+}
+
+/// One declared body field: a JSON Pointer into the body and the type it lowers to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EgressBodyField {
+    /// An RFC 6901 JSON Pointer, such as `/filter/spaces`.
+    pub(crate) pointer: String,
+    /// `string`, `long`, `bool`, `set<string>`, or `set<long>`.
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
 }
 
 /// What an egress destination speaks.
@@ -443,6 +503,32 @@ impl EgressSecret {
 }
 
 impl EgressEntry {
+    /// The policy route this entry's `body.fields` declares, or `None` when it declares none. A
+    /// declaration the policy crate refuses is a config refusal naming the entry.
+    pub(crate) fn body_route(
+        &self,
+        name: &str,
+    ) -> Result<Option<policy::HttpBodyRoute>, ConfigError> {
+        let Some(body) = &self.body else {
+            return Ok(None);
+        };
+        policy::HttpBodyRoute::new(
+            name,
+            body.fields.iter().map(|(field, declared)| {
+                (
+                    field.clone(),
+                    declared.pointer.clone(),
+                    declared.kind.clone(),
+                )
+            }),
+        )
+        .map(Some)
+        .map_err(|error| ConfigError::Credential {
+            host: self.destinations.first().cloned().unwrap_or_default(),
+            reason: format!("`[egress.{name}] body.fields`: {error}"),
+        })
+    }
+
     fn pattern(&self, destination: &str) -> Result<DestinationPattern, ConfigError> {
         DestinationPattern::parse(destination).map_err(|source| ConfigError::Credential {
             host: destination.to_string(),
@@ -843,6 +929,66 @@ mod tests {
                 crate::record::config::env::checked_provisioned_name("api.test", &name).ok()
             })
             .expect("the test process has a valid credential variable")
+    }
+
+    #[test]
+    fn body_fields_parse_and_build_a_policy_route() {
+        let entries = load(
+            r#"
+            [egress.wiki]
+            destinations = ["wiki.example.com"]
+            secret.ref = "env://TOKEN"
+            body.fields.spaces = { pointer = "/filter/spaces", type = "set<string>" }
+            "#,
+        )
+        .expect("valid");
+        let route = entries["wiki"]
+            .body_route("wiki")
+            .expect("valid route")
+            .expect("declares body fields");
+        assert_eq!(route.namespace(), "wiki");
+        assert_eq!(route.fields()[0].pointer(), "/filter/spaces");
+    }
+
+    #[test]
+    fn bad_body_fields_are_refused_at_parse() {
+        for (field, why) in [
+            (
+                r#"spaces = { pointer = "filter", type = "string" }"#,
+                "pointer",
+            ),
+            (r#"spaces = { pointer = "/a", type = "set<bool>" }"#, "type"),
+            (r#"host = { pointer = "/a", type = "string" }"#, "name"),
+        ] {
+            let text = format!(
+                "[egress.wiki]\ndestinations = [\"wiki.example.com\"]\nsecret.ref = \"env://TOKEN\"\n[egress.wiki.body.fields]\n{field}\n"
+            );
+            let error = load(&text).expect_err(why).to_string();
+            assert!(error.contains("body.fields"), "{why}: {error}");
+        }
+        let empty = "[egress.wiki]\ndestinations = [\"wiki.example.com\"]\nsecret.ref = \"env://TOKEN\"\nbody.fields = {}\n";
+        assert!(load(empty).is_err(), "an empty table opts in to nothing");
+    }
+
+    #[test]
+    fn an_unknown_key_under_body_is_refused() {
+        let text = "[egress.wiki]\ndestinations = [\"wiki.example.com\"]\nsecret.ref = \"env://TOKEN\"\nbody.paths = [\"/x\"]\n";
+        assert!(toml::from_str::<Fixture>(text).is_err());
+    }
+
+    #[test]
+    fn a_remote_mcp_entry_takes_no_body_fields() {
+        let error = load(
+            r#"
+            [egress.issues]
+            destinations = ["issues.example.com"]
+            protocol = "mcp"
+            body.fields.f = { pointer = "/a", type = "long" }
+            "#,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(error.contains("body.fields"), "{error}");
     }
 
     #[test]
