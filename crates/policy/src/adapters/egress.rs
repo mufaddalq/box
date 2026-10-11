@@ -215,6 +215,7 @@ impl EgressEffectInterceptor for EgressPolicyInterceptor {
                 body_bytes,
                 intercepted,
                 mcp,
+                body: _,
             } => {
                 // The `http:request` gate. `decide` records to history, so it is called exactly
                 // once here; the `mcp:call` gate below is the second recorded decision.
@@ -749,6 +750,7 @@ mod tests {
             body_bytes: 32,
             intercepted: false,
             mcp: Some(McpFrame::List { server, method }),
+            body: None,
         }
     }
 
@@ -770,6 +772,7 @@ mod tests {
                 tool,
                 arguments,
             }),
+            body: None,
         }
     }
 
@@ -1378,6 +1381,7 @@ mod tests {
                 body_bytes: 42,
                 intercepted: true,
                 mcp: None,
+                body: None,
             })
             .expect("request is allowed")
             .record_outcome(EgressEffectOutcome::Completed(100))
@@ -1408,6 +1412,7 @@ mod tests {
             body_bytes: 0,
             intercepted: true,
             mcp: None,
+            body: None,
         };
         let response = EgressEffectAttempt::ResponseRelease {
             host: "api.github.com",
@@ -1499,6 +1504,7 @@ mod tests {
             body_bytes: 0,
             intercepted: true,
             mcp: None,
+            body: None,
         };
         for _ in 0..3 {
             fixture
@@ -1567,6 +1573,7 @@ mod tests {
             body_bytes: 0,
             intercepted: true,
             mcp: None,
+            body: None,
         };
         for (source, admitted_after) in [(count_all, false), (count_errors, true)] {
             let fixture = interceptor(source);
@@ -1662,6 +1669,7 @@ mod tests {
             body_bytes,
             intercepted: true,
             mcp: None,
+            body: None,
         };
 
         interceptor
@@ -1693,6 +1701,7 @@ mod tests {
             body_bytes: 0,
             intercepted,
             mcp: None,
+            body: None,
         };
 
         // TLS-terminated (intercepted == true) satisfies the rule.

@@ -84,6 +84,58 @@ impl std::fmt::Debug for McpFrame<'_> {
     }
 }
 
+/// The request body of an `HttpRequest` whose destination matched an `[egress.<name>]
+/// body.fields` route, for the `http_body` refinement.
+///
+/// `route` is **config-assigned** (the matched route's name); the bytes are workload-controlled.
+/// `encoded` is whether the request carried a `Content-Encoding` other than `identity`, so the
+/// policy can refuse to parse it. Its `Debug` prints the route and the length, never the bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HttpBody<'a> {
+    route: &'a str,
+    bytes: &'a [u8],
+    encoded: bool,
+}
+
+impl<'a> HttpBody<'a> {
+    /// A body view for `route`.
+    pub fn new(route: &'a str, bytes: &'a [u8], encoded: bool) -> Self {
+        Self {
+            route,
+            bytes,
+            encoded,
+        }
+    }
+
+    /// The config-assigned route name.
+    pub fn route(&self) -> &'a str {
+        self.route
+    }
+
+    /// The bytes forwarded to the upstream.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Whether the request declared a content coding other than `identity`.
+    pub fn encoded(&self) -> bool {
+        self.encoded
+    }
+}
+
+impl std::fmt::Debug for HttpBody<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The bytes are workload-controlled and may carry anything, so an attempt's Debug names
+        // only their length.
+        f.debug_struct("HttpBody")
+            .field("route", &self.route)
+            .field("len", &self.bytes.len())
+            .field("encoded", &self.encoded)
+            .field("bytes", &"<redacted>")
+            .finish()
+    }
+}
+
 /// An outbound operation presented immediately before its external effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -126,6 +178,9 @@ pub enum EffectAttempt<'a> {
         /// The MCP frame this request carries, when its destination is a configured remote MCP
         /// server; `None` otherwise. Present drives the `mcp:call` gate alongside `http:request`.
         mcp: Option<McpFrame<'a>>,
+        /// Present only when the request matched an `[egress.<name>] body.fields` route; carries
+        /// the forwarded bytes for the `http_body` refinement.
+        body: Option<HttpBody<'a>>,
     },
     /// Returning one serialized, governed HTTP response to the workload.
     ResponseRelease {
@@ -241,6 +296,18 @@ impl Drop for ClaimedEffectPermit {
         if let Some(permit) = self.permit.take() {
             permit.mark_indeterminate();
         }
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::HttpBody;
+
+    #[test]
+    fn a_body_view_debug_names_the_length_and_never_the_bytes() {
+        let printed = format!("{:?}", HttpBody::new("r", b"secret", false));
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(printed.contains('6'), "{printed}");
     }
 }
 

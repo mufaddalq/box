@@ -18,7 +18,9 @@ use crate::audit::Decision as AuditDecision;
 use crate::audit::{EgressDecision, NetworkAuditEvent};
 use crate::boundary::{BodyRef, HeaderMap, InterceptedRequest, InterceptedResponse, Target};
 use crate::capability::{CapabilityContext, CapabilitySet};
-use crate::effect::{ClaimedEffectPermit, EffectAttempt, EffectOutcome, McpFrame, McpListReply};
+use crate::effect::{
+    ClaimedEffectPermit, EffectAttempt, EffectOutcome, HttpBody, McpFrame, McpListReply,
+};
 use crate::error::{ProxyError, Result};
 use crate::mcp::{
     McpTarget, McpTargetIdentity, canonicalize_mcp_frame, decode_unreserved, mcp_denial_response,
@@ -172,6 +174,9 @@ where
     // `req.target.path` *is* the secret. Every authorization and audit input below reads this value
     // instead, so an attempt or a durable record never carries credential material.
     let workload_path = req.target.path.clone();
+    // Matched on the canonical target before any credential mutation, as the credential controls
+    // match it.
+    let body_route = state.body_route_for(&req.target.as_destination());
 
     match request_leg::evaluate_and_apply(&state.controls, &mut req, &cx) {
         RequestDecision::Block(reason) => {
@@ -309,6 +314,8 @@ where
         path: &workload_path,
         body_bytes: forwarded_body.len(),
         intercepted,
+        body: body_route
+            .map(|route| HttpBody::new(route, &forwarded_body, is_content_encoded(&req.headers))),
         mcp: mcp_target.as_ref().map(|(server, target)| {
             let server = *server;
             match &target.identity {
@@ -527,6 +534,16 @@ where
         response_permit,
         "governed response",
     )
+}
+
+/// Whether any `Content-Encoding` header names a coding other than `identity`. Several headers,
+/// or a list, count as encoded unless every coding is `identity`.
+fn is_content_encoded(headers: &HeaderMap) -> bool {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .flat_map(|(_, value)| value.split(','))
+        .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
 }
 
 /// Forward a plain-HTTP (non-TLS) exchange to an already-open plaintext upstream.

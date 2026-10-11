@@ -15,8 +15,8 @@ use credentials::{
 };
 use egress_gateway::{
     AuditDecision, CapabilitySet, CredentialCapability, EffectAttempt, EffectInterceptor,
-    EffectOutcome, EffectPermit, EgressDecision, Emitter, McpFrame, MitmConfig, MitmInterceptor,
-    StubEmitter,
+    EffectOutcome, EffectPermit, EgressDecision, Emitter, HttpBody, McpFrame, MitmConfig,
+    MitmInterceptor, StubEmitter,
 };
 
 use harness::{TlsUpstream, WorkloadClient};
@@ -47,6 +47,9 @@ enum AttemptSnapshot {
         method: String,
         path: String,
         body_bytes: usize,
+        body_route: Option<String>,
+        body_len: Option<usize>,
+        encoded: Option<bool>,
     },
     ResponseRelease {
         host: String,
@@ -84,12 +87,16 @@ impl AttemptSnapshot {
                 body_bytes,
                 intercepted: _,
                 mcp: _,
+                body,
             } => Self::HttpRequest {
                 host: (*host).to_string(),
                 port: *port,
                 method: (*method).to_string(),
                 path: (*path).to_string(),
                 body_bytes: *body_bytes,
+                body_route: body.map(|body| body.route().to_string()),
+                body_len: body.map(|body| body.bytes().len()),
+                encoded: body.map(|body| body.encoded()),
             },
             EffectAttempt::ResponseRelease {
                 host,
@@ -1098,6 +1105,8 @@ fn attempt_schema_never_carries_body_or_header_content() {
         body_bytes: 42,
         intercepted: true,
         mcp: None,
+        // A body route's view carries the forwarded bytes; its Debug names only the length.
+        body: Some(HttpBody::new("wiki", b"body content with a secret", false)),
     };
 
     let rendered = format!("{attempt:?}").to_ascii_lowercase();
@@ -1121,6 +1130,7 @@ fn attempt_schema_never_carries_body_or_header_content() {
                 tool,
                 arguments: r#"{"password":"the-secret-value"}"#,
             }),
+            body: None,
         };
         let rendered = format!("{attempt:?}").to_ascii_lowercase();
         assert!(
@@ -1141,4 +1151,123 @@ fn attempt_schema_never_carries_body_or_header_content() {
             "the protocol method is a bounded verb and stays visible: {rendered}"
         );
     }
+}
+
+fn body_views(events: &[Event]) -> Vec<(Option<String>, Option<usize>, Option<bool>)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Attempt(AttemptSnapshot::HttpRequest {
+                body_route,
+                body_len,
+                encoded,
+                ..
+            }) => Some((body_route.clone(), *body_len, *encoded)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_body_route_hands_the_policy_a_redacted_body_view_only_on_its_paths() {
+    let host = "wiki.test";
+    let upstream = TlsUpstream::start(host);
+    let port = upstream.port();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut config = config_for(host, &upstream);
+    config.body_routes = vec![(
+        DestinationPattern::parse(&format!("{host}:{port}/rest")).unwrap(),
+        "wiki".to_string(),
+    )];
+    let handle = MitmInterceptor::start(
+        config,
+        no_injection(),
+        Arc::new(RecordingInterceptor::allowing(events.clone())),
+    )
+    .unwrap();
+
+    for (path, headers) in [
+        ("/rest/search", vec![]),
+        ("/other", vec![]),
+        ("/rest/search", vec![("Content-Encoding", "gzip")]),
+    ] {
+        let mut client = WorkloadClient::connect(proxy_port(&handle), host, port);
+        client.send_request("POST", path, &headers, br#"{"space":"body-secret"}"#);
+        assert_eq!(client.read_status(), 200);
+    }
+    let events = wait_for_event_count(&events, 21);
+    assert_eq!(
+        body_views(&events),
+        vec![
+            (Some("wiki".into()), Some(23), Some(false)),
+            (None, None, None),
+            (Some("wiki".into()), Some(23), Some(true)),
+        ]
+    );
+}
+
+#[test]
+fn a_plain_http_body_route_hands_the_policy_the_body_view() {
+    use std::io::{Read as _, Write as _};
+
+    let host = "plain-wiki.test";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(mut tcp) = incoming else { continue };
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !seen.ends_with(b"}") {
+                match tcp.read(&mut chunk) {
+                    Ok(n) if n > 0 => seen.extend_from_slice(&chunk[..n]),
+                    _ => break,
+                }
+            }
+            let _ =
+                tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let config = MitmConfig {
+        dns_overrides: vec![(host.to_string(), "127.0.0.1".parse().unwrap())],
+        body_routes: vec![(
+            DestinationPattern::parse(&format!("{host}:{port}")).unwrap(),
+            "wiki".to_string(),
+        )],
+        ..MitmConfig::default()
+    };
+    let handle = MitmInterceptor::start(
+        config,
+        no_injection(),
+        Arc::new(RecordingInterceptor::allowing(events.clone())),
+    )
+    .unwrap();
+
+    let body = br#"{"space":"eng"}"#;
+    let mut proxy =
+        std::net::TcpStream::connect(("127.0.0.1", proxy_port(&handle))).expect("the proxy");
+    proxy
+        .write_all(
+            format!(
+                "POST http://{host}:{port}/rest/search HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    proxy.write_all(body).unwrap();
+    let mut reply = Vec::new();
+    let _ = proxy.read_to_end(&mut reply);
+    assert!(
+        reply.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&reply)
+    );
+
+    let events = wait_for_event_count(&events, 7);
+    assert_eq!(
+        body_views(&events),
+        vec![(Some("wiki".into()), Some(body.len()), Some(false))]
+    );
 }

@@ -23,7 +23,7 @@ pub use capability::{
     CredentialCapability,
 };
 pub use effect::{
-    EffectAttempt, EffectInterceptor, EffectOutcome, EffectPermit, McpFrame, McpListReply,
+    EffectAttempt, EffectInterceptor, EffectOutcome, EffectPermit, HttpBody, McpFrame, McpListReply,
 };
 pub use error::{PROXY_ORIGIN_HEADER, PROXY_ORIGIN_VALUE, ProxyError, Result};
 pub use intercept::Interceptor;

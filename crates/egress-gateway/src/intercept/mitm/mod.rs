@@ -97,6 +97,11 @@ pub struct MitmConfig {
     /// borrow another server's identity. Host-only match (a host registers all its ports). Empty means
     /// no remote MCP servers, and every existing caller keeps today's behavior unchanged.
     pub mcp_servers: Vec<(String, String)>,
+    /// Egress routes that declare request-body fields, as `(destination pattern, route name)`
+    /// pairs. A request whose canonical destination matches a pattern carries its body on the
+    /// `HttpRequest` attempt for the `http_body` refinement. The first match wins; the box's
+    /// config validation keeps the patterns from overlapping. Empty means no route reads a body.
+    pub body_routes: Vec<(credentials::DestinationPattern, String)>,
 }
 
 impl Default for MitmConfig {
@@ -115,6 +120,7 @@ impl Default for MitmConfig {
             upstream_read_deadline: std::time::Duration::from_secs(300),
             max_connections: 256,
             mcp_servers: Vec::new(),
+            body_routes: Vec::new(),
         }
     }
 }
@@ -169,6 +175,16 @@ impl SharedState {
             .mcp_servers
             .iter()
             .find(|(configured, _)| connect::same_host(configured, host))
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// The body route a request's canonical destination matches, if any. The same `Destination`
+    /// the credential controls match, so a body route and a credential route agree on a path.
+    fn body_route_for(&self, destination: &credentials::Destination<'_>) -> Option<&str> {
+        self.config
+            .body_routes
+            .iter()
+            .find(|(pattern, _)| pattern.matches(destination))
             .map(|(_, name)| name.as_str())
     }
 }

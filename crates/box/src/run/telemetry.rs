@@ -1055,6 +1055,7 @@ mod tests {
                 body_bytes: 0,
                 intercepted: true,
                 mcp: None,
+                body: None,
             })
             .expect("ordinary HTTP is admitted")
             .mark_indeterminate();
@@ -1142,6 +1143,7 @@ mod tests {
                 body_bytes: 0,
                 intercepted: true,
                 mcp: None,
+                body: None,
             })
             .err()
             .expect("no permit matches a GET");
@@ -1220,6 +1222,7 @@ mod tests {
             body_bytes: 0,
             intercepted: true,
             mcp: None,
+            body: None,
         };
         let emitted = |host: &str, port, method: &str, path: &str| EgressDecision {
             host: host.to_string(),
@@ -1433,6 +1436,7 @@ mod tests {
                 tool: "add",
                 arguments,
             }),
+            body: None,
         }
     }
 
