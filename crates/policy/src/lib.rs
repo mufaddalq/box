@@ -9,6 +9,7 @@ mod catalog;
 mod decision;
 mod dogwood;
 mod error;
+mod http_body;
 mod mcp_schema;
 mod observe;
 mod outcome;
@@ -35,6 +36,9 @@ pub use catalog::{
 pub use decision::{Decision, DenyReason, PolicyAttribution, RuleId};
 pub use dogwood::event_schema_source;
 pub use error::{PolicyDiagnostic, PolicyError, PolicyStagingError};
+pub use http_body::{
+    HttpBodyError, HttpBodyField, HttpBodyFieldType, HttpBodyRoute, generate_http_body_schema,
+};
 pub use mcp_schema::{
     McpSchemaError, compose_action_schema, generate_mcp_schema, validate_mcp_schema_composition,
 };
