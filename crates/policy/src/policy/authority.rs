@@ -9,7 +9,8 @@ use dogwood_local_engine::DurableError;
 
 use super::{Policy, SchemaStage, authored};
 use crate::dogwood::{DogwoodEngine, parse_policy_source, validate_canonical_policy_set};
-use crate::schema::{ActionIdentity, GovernedBox};
+use crate::http_body::{HTTP_BODY_ACTION, HttpBodyRoute, generate_http_body_schema};
+use crate::schema::{ActionIdentity, GovernedBox, mcp_action_namespace};
 use crate::spelling::{Operator, PolicyWarning};
 use crate::{Decision, Outcome, PolicyError, PolicyStagingError, Principal, Request};
 
@@ -24,6 +25,9 @@ struct ProposalState {
     operator: Operator,
     candidates: Vec<CandidatePolicy>,
     schemas: BTreeMap<String, String>,
+    /// The generated `http_body` fragments, keyed by egress route. Known at open, so they are
+    /// part of every validation from the first, never staged.
+    body_schemas: BTreeMap<String, String>,
     ready: BTreeSet<usize>,
     pending: BTreeMap<usize, String>,
 }
@@ -57,6 +61,8 @@ pub(super) struct Authority {
     proposal: Mutex<Option<ProposalState>>,
     live: Mutex<LiveAuthority>,
     warnings: Vec<PolicyWarning>,
+    /// The egress routes that declare body fields, keyed by route name.
+    body_routes: BTreeMap<String, HttpBodyRoute>,
 }
 
 impl Authority {
@@ -81,6 +87,7 @@ impl Authority {
                 degraded_tools: BTreeSet::new(),
             }),
             warnings,
+            body_routes: BTreeMap::new(),
         })
     }
 
@@ -88,20 +95,28 @@ impl Authority {
     pub(super) fn open_staged(
         operator: &Operator,
         sources: Vec<Policy>,
+        body_routes: Vec<HttpBodyRoute>,
         history: &Path,
     ) -> Result<Self, PolicyStagingError> {
-        Self::open_staged_with_engine(operator, sources, DogwoodEngine::open_for_staging(history)?)
+        Self::open_staged_with_engine(
+            operator,
+            sources,
+            body_routes,
+            DogwoodEngine::open_for_staging(history)?,
+        )
     }
 
     pub(super) fn open_staged_file(
         operator: &Operator,
         sources: Vec<Policy>,
+        body_routes: Vec<HttpBodyRoute>,
         history: File,
         label: std::path::PathBuf,
     ) -> Result<Self, PolicyStagingError> {
         Self::open_staged_with_engine(
             operator,
             sources,
+            body_routes,
             DogwoodEngine::open_for_staging_file(history, label)?,
         )
     }
@@ -109,6 +124,7 @@ impl Authority {
     fn open_staged_with_engine(
         operator: &Operator,
         sources: Vec<Policy>,
+        body_routes: Vec<HttpBodyRoute>,
         mut engine: DogwoodEngine,
     ) -> Result<Self, PolicyStagingError> {
         let candidates = parse_policy_source(&authored(&sources))?
@@ -119,16 +135,30 @@ impl Authority {
                 expanded_source,
             })
             .collect::<Vec<_>>();
+        let body_schemas = body_routes
+            .iter()
+            .map(|route| (route.route().to_string(), generate_http_body_schema(route)))
+            .collect();
+        let body_routes = body_routes
+            .into_iter()
+            .map(|route| (route.route().to_string(), route))
+            .collect();
         let mut proposal = ProposalState {
             operator: operator.clone(),
             candidates,
             schemas: BTreeMap::new(),
+            body_schemas,
             ready: BTreeSet::new(),
             pending: BTreeMap::new(),
         };
+        // Two routes, or a route and `Box`, that share a namespace are refused here, before any
+        // rule is judged against an ambiguous schema.
+        crate::mcp_schema::validate_mcp_schema_composition(&proposal.named_schemas())
+            .map_err(|error| PolicyError::Schema(error.to_string()))?;
+        let schemas = proposal.schema_sources();
         let complete = proposal.complete_policy_set();
         let (readiness, pending_tools, warnings) =
-            match validate_canonical_policy_set(&complete, &[], operator) {
+            match validate_canonical_policy_set(&complete, &schemas, operator) {
                 Ok((effective_schema, warnings)) => {
                     engine
                         .commit_staged(&complete, effective_schema)
@@ -145,14 +175,14 @@ impl Authority {
                     return Err(inert.into());
                 }
                 Err(_) => {
-                    proposal.classify(&[])?;
+                    proposal.classify(&schemas)?;
                     // Serve the schema-independent subset while typed schemas stage
                     // (`Discovering`), instead of denying every request. A per-tool rule whose server
                     // never stages (its `tools/list` is denied) is not refused here;
                     // `finish_mcp_discovery` degrades that one server instead.
                     let subset = proposal.ready_policy_set();
                     let (effective_schema, warnings) =
-                        validate_canonical_policy_set(&subset, &[], operator)?;
+                        validate_canonical_policy_set(&subset, &schemas, operator)?;
                     engine
                         .commit_staged(&subset, effective_schema)
                         .map_err(|error| PolicyStagingError::Durable(error.to_string()))?;
@@ -173,7 +203,13 @@ impl Authority {
                 degraded_tools: BTreeSet::new(),
             }),
             warnings,
+            body_routes,
         })
+    }
+
+    /// The route a body refinement names, if it declared body fields.
+    pub(super) fn body_route(&self, route: &str) -> Option<&HttpBodyRoute> {
+        self.body_routes.get(route)
     }
 
     pub(super) fn warnings(&self) -> &[PolicyWarning] {
@@ -426,6 +462,7 @@ impl Authority {
                 degraded_tools: BTreeSet::new(),
             }),
             warnings: Vec::new(),
+            body_routes: BTreeMap::new(),
         })
     }
 
@@ -444,6 +481,7 @@ impl Authority {
                 degraded_tools: BTreeSet::new(),
             }),
             warnings: Vec::new(),
+            body_routes: BTreeMap::new(),
         })
     }
 
@@ -538,12 +576,26 @@ impl ProposalState {
 
     /// Whether a candidate names a per-tool action. A rule over the fixed vocabulary alone cannot
     /// become valid when a tool schema stages, so its load error is a refusal and not a pending state.
+    ///
+    /// A body route's `http_body` action is not a per-tool action: its schema is known at open,
+    /// so a rule over it that does not validate never will, and setting it aside would drop a
+    /// forbid.
     fn names_a_typed_action(&self, ordinal: usize) -> bool {
         let mut typed = BTreeSet::new();
         if let Some(candidate) = self.candidates.get(ordinal) {
             collect_typed_actions(&candidate.expanded_source, &mut typed);
         }
-        !typed.is_empty()
+        typed
+            .iter()
+            .any(|(namespace, action)| !self.is_body_action(namespace, action))
+    }
+
+    fn is_body_action(&self, namespace: &str, action: &str) -> bool {
+        action == HTTP_BODY_ACTION
+            && self
+                .body_schemas
+                .keys()
+                .any(|route| mcp_action_namespace(route) == namespace)
     }
 
     fn mark_all_ready(&mut self) {
@@ -555,15 +607,22 @@ impl ProposalState {
         self.pending.clear();
     }
 
+    /// Every fragment by the name its namespace derives from: body routes, then MCP servers. A
+    /// route and a server that normalize to one namespace collide here.
     fn named_schemas(&self) -> Vec<(&str, &str)> {
-        self.schemas
+        self.body_schemas
             .iter()
-            .map(|(server, source)| (server.as_str(), source.as_str()))
+            .chain(&self.schemas)
+            .map(|(name, source)| (name.as_str(), source.as_str()))
             .collect()
     }
 
     fn schema_sources(&self) -> Vec<String> {
-        self.schemas.values().cloned().collect()
+        self.body_schemas
+            .values()
+            .chain(self.schemas.values())
+            .cloned()
+            .collect()
     }
 }
 
@@ -723,6 +782,7 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             staged_source(),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("the staged authority opens");
@@ -743,6 +803,7 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             staged_source(),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("the staged authority opens");
@@ -763,6 +824,7 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             staged_source(),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("the staged authority opens");
@@ -789,6 +851,7 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             staged_source(),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("the staged authority opens");
@@ -891,6 +954,7 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             source(r#"permit(principal, action == Box::Action::"shell:exec", resource);"#),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("the canonical authority opens");
@@ -983,8 +1047,9 @@ permit(principal, action == Box::Action::"mcp:call", resource) when { context.in
             // rule is the sole new policy, so the exhausted ordinal space rejects it at stage time.
             text: r#"permit(principal, action == alpha::Action::"read", resource);"#.to_string(),
         });
-        let authority = Authority::open_staged(&Operator::unanchored(), staged_sources, &path)
-            .expect("staged policy opens");
+        let authority =
+            Authority::open_staged(&Operator::unanchored(), staged_sources, Vec::new(), &path)
+                .expect("staged policy opens");
         let result = authority
             .stage_mcp_schema("alpha", generated("alpha", "read", "path"))
             .expect("durable rejection is proposal-specific");
@@ -1096,6 +1161,7 @@ when temporal {
         let refused = Authority::open_staged(
             &Operator::unanchored(),
             policies,
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         );
         match refused {
@@ -1117,6 +1183,7 @@ when temporal {
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             discovering_source(),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("a typed rule with tools/list permitted opens Discovering");
@@ -1142,6 +1209,7 @@ when temporal {
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             discovering_source(),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("opens Discovering");
@@ -1182,6 +1250,7 @@ when temporal {
 forbid(principal, action == Box::Action::"mcp:call", resource) when { context.input.server == "alpha" && context.input.method == "tools/list" };
 permit(principal, action == alpha::Action::"read", resource);"#,
             ),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect(
@@ -1212,6 +1281,7 @@ permit(principal, action == alpha::Action::"read", resource);"#,
                 r#"permit(principal, action == Box::Action::"mcp:call", resource) when { context.input.server == "alpha" && context.input.method == "initialize" };
 permit(principal, action == alpha::Action::"read", resource);"#,
             ),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("a default-denied tools/list with a typed rule loads");
@@ -1236,6 +1306,7 @@ permit(principal, action == alpha::Action::"read", resource);"#,
 forbid(principal, action == Box::Action::"mcp:call", resource) when { context.input.server == "issues-mcp" && context.input.method == "tools/list" };
 permit(principal, action == issues_mcp::Action::"search", resource);"#,
             ),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("a hyphenated tools/list-denied server with a typed rule loads");
@@ -1274,6 +1345,7 @@ permit(principal, action == issues_mcp::Action::"search", resource);"#,
                 r#"permit(principal, action == Box::Action::"mcp:call", resource) when { context.input.server == "alpha" };
 forbid(principal, action == Box::Action::"mcp:call", resource) when { context.input.server == "alpha" && context.input.method == "tools/list" };"#,
             ),
+            Vec::new(),
             &history.path().join("dogwood.redb"),
         )
         .expect("a tools/list forbid without a typed rule loads");
@@ -1328,7 +1400,7 @@ forbid(principal, action == Box::Action::"mcp:call", resource) when { context.in
 permit(principal, action == Box::Action::"mcp:call", resource) when { context.input.server == "alpha" };
 permit(principal, action == alpha::Action::"read", resource);"#,
         );
-        let error = Authority::open_staged(&Operator::unanchored(), sources, &path)
+        let error = Authority::open_staged(&Operator::unanchored(), sources, Vec::new(), &path)
             .err()
             .expect("an exhausted subset commit fails open closed");
         assert!(
@@ -1360,6 +1432,7 @@ permit(principal, action == alpha::Action::"read", resource);"#,
             Authority::open_staged(
                 &Operator::unanchored(),
                 contradiction,
+                Vec::new(),
                 &history.path().join("c.redb")
             )
             .is_ok(),
@@ -1373,6 +1446,7 @@ permit(principal, action == alpha::Action::"read", resource);"#,
             Authority::open_staged(
                 &Operator::unanchored(),
                 clean,
+                Vec::new(),
                 &history.path().join("d.redb")
             )
             .is_ok()
@@ -1393,6 +1467,7 @@ permit(principal, action == alpha::Action::"read", resource);"#,
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             staged_source(),
+            Vec::new(),
             &history.path().join("initial.redb"),
         )
         .expect("the blocked authority opens");
@@ -1456,6 +1531,7 @@ permit(principal, action == alpha::Action::"read", resource);"#,
         let authority = Authority::open_staged(
             &Operator::unanchored(),
             staged_source(),
+            Vec::new(),
             &history.path().join("initial.redb"),
         )
         .expect("the blocked authority opens");

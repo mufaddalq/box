@@ -24,11 +24,12 @@ use dogwood_local_engine::{
 };
 
 use crate::error::{PolicyError, PolicyStagingError};
+use crate::http_body::HTTP_BODY_ACTION;
 use crate::outcome::Delivery;
 use crate::request::{Principal, Request};
 use crate::schema::{
     AGENT_TYPE, ActionIdentity, ActionSchema, GovernedBox, RESOURCE_TYPE, SCHEMA_SRC,
-    UNUSED_RESOURCE_ID, action, action_schema, attr,
+    UNUSED_RESOURCE_ID, action, action_schema, attr, http_body_input,
 };
 use crate::spelling::{Operator, PolicyWarning};
 use crate::{Decision, DenyReason, Outcome, PolicyAttribution, RuleId};
@@ -53,6 +54,9 @@ impl ActionIdentity {
             Self::Fixed { id } => Event::builder_for(FIXED_ACTION_NAMESPACE, id, kind),
             Self::McpTool { namespace, tool } => {
                 Event::builder_for(&[namespace, "Action"], tool, kind)
+            }
+            Self::HttpBody { namespace } => {
+                Event::builder_for(&[namespace, "Action"], HTTP_BODY_ACTION, kind)
             }
         }
     }
@@ -821,6 +825,10 @@ fn request_event(
     {
         return with_input(builder, json_value(arguments));
     }
+    // A body refinement records the same merged input its Cedar context carries.
+    if let Request::HttpBody { .. } = request {
+        return with_input(builder, json_value(&http_body_input(request)));
+    }
     with_fields(builder, governed, principal, request_fields(request))
 }
 
@@ -1002,6 +1010,8 @@ fn request_fields(request: &Request<'_>) -> Vec<(&'static str, Value)> {
             (attr::BODY_BYTES, Value::Int(clamp(*body_bytes))),
             (attr::INTERCEPTED, Value::Bool(*intercepted)),
         ],
+        // Written in `request_event` from `schema::http_body_input`.
+        Request::HttpBody { .. } => Vec::new(),
         Request::McpCall {
             server,
             method,

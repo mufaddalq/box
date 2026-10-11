@@ -7,6 +7,7 @@ use std::sync::Arc;
 mod authority;
 
 use crate::dogwood::{DogwoodEngine, parse_policy_source};
+use crate::http_body::{HttpBodyRoute, generate_http_body_schema};
 use crate::schema::GovernedBox;
 use crate::{
     Decision, Operator, Outcome, PolicyError, PolicyStagingError, PolicyWarning, Principal, Request,
@@ -98,12 +99,24 @@ impl PolicyEngine {
         sources: Vec<Policy>,
         history: &Path,
     ) -> Result<Self, PolicyStagingError> {
+        Self::open_staged_with_body_routes(operator, sources, Vec::new(), history)
+    }
+
+    /// [`open_staged`](Self::open_staged), with the egress routes that declare body fields. Each
+    /// route's `http_body` fragment is part of the schema from the first validation, so a rule
+    /// naming it is never pending.
+    pub fn open_staged_with_body_routes(
+        operator: &Operator,
+        sources: Vec<Policy>,
+        body_routes: Vec<HttpBodyRoute>,
+        history: &Path,
+    ) -> Result<Self, PolicyStagingError> {
         let effective = EffectivePolicy {
             engine: ENGINE_ID,
             policy_id: effective_policy_id(&sources),
         };
         Ok(Self {
-            authority: Authority::open_staged(operator, sources, history)?,
+            authority: Authority::open_staged(operator, sources, body_routes, history)?,
             effective,
             observer: None,
         })
@@ -116,12 +129,24 @@ impl PolicyEngine {
         history: File,
         label: PathBuf,
     ) -> Result<Self, PolicyStagingError> {
+        Self::open_staged_file_with_body_routes(operator, sources, Vec::new(), history, label)
+    }
+
+    /// [`open_staged_file`](Self::open_staged_file), with the egress routes that declare body
+    /// fields.
+    pub fn open_staged_file_with_body_routes(
+        operator: &Operator,
+        sources: Vec<Policy>,
+        body_routes: Vec<HttpBodyRoute>,
+        history: File,
+        label: PathBuf,
+    ) -> Result<Self, PolicyStagingError> {
         let effective = EffectivePolicy {
             engine: ENGINE_ID,
             policy_id: effective_policy_id(&sources),
         };
         Ok(Self {
-            authority: Authority::open_staged_file(operator, sources, history, label)?,
+            authority: Authority::open_staged_file(operator, sources, body_routes, history, label)?,
             effective,
             observer: None,
         })
@@ -191,6 +216,16 @@ impl PolicyEngine {
     ) -> Result<(), PolicyError> {
         DogwoodEngine::validate_with_mcp_schemas(&authored(sources), mcp_schemas, operator)
             .map(|_| ())
+    }
+
+    /// Strict-validate candidate sources with the `http_body` fragments of `body_routes`.
+    pub fn validate_with_body_routes(
+        operator: &Operator,
+        sources: &[Policy],
+        body_routes: &[HttpBodyRoute],
+    ) -> Result<(), PolicyError> {
+        let fragments: Vec<String> = body_routes.iter().map(generate_http_body_schema).collect();
+        Self::validate_with_mcp_schemas(operator, sources, &fragments)
     }
 
     /// Validate syntax, macro expansion, and provider use without an action schema.
@@ -341,6 +376,75 @@ impl PolicyEngine {
                 resource: String::new(),
             },
             // An explicit `forbid`, an internal fault, or an allow — enforce as decided.
+            other => other,
+        };
+        self.conclude(&identity, &request, decision)
+    }
+
+    /// The body refinement for one L7 request to `route`, decided after `http:request` allowed it.
+    ///
+    /// Forbid-only, like [`refine_tool_call`](Self::refine_tool_call): with no matching rule the
+    /// `http:request` verdict stands, and only an explicit `forbid` or a fault denies. The body is
+    /// read by the strict extractor; a body it cannot parse sets `body_json = false` and leaves
+    /// every declared field absent, so the rule decides. A route that declared no body fields is
+    /// an internal fault, which denies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refine_http_body(
+        &self,
+        governed: &GovernedBox,
+        principal: &Principal,
+        route: &str,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        body_bytes: usize,
+        intercepted: bool,
+        body: &[u8],
+        encoded: bool,
+    ) -> Decision {
+        let Some(declared) = self.authority.body_route(route) else {
+            let identity = crate::schema::ActionIdentity::HttpBody {
+                namespace: crate::schema::mcp_action_namespace(route),
+            };
+            let input = serde_json::Value::Null;
+            let request = Request::HttpBody {
+                namespace: route,
+                host,
+                port,
+                method,
+                path,
+                body_bytes,
+                intercepted,
+                input: &input,
+            };
+            return self.conclude(&identity, &request, Decision::internal_fault());
+        };
+        let input = declared.extract(body, encoded);
+        let request = Request::HttpBody {
+            namespace: declared.namespace(),
+            host,
+            port,
+            method,
+            path,
+            body_bytes,
+            intercepted,
+            input: &input,
+        };
+        let identity = crate::schema::ActionIdentity::for_request(&request);
+        let decision = match self
+            .authority
+            .decide(governed, principal, &request, &identity)
+        {
+            // No body rule matched: the `http:request` allow stands.
+            Decision::Deny {
+                reason: crate::DenyReason::NoMatch,
+                ..
+            } => Decision::Allow {
+                rule: crate::RuleId::default_deny(),
+                attribution: Vec::new(),
+                resource: String::new(),
+            },
             other => other,
         };
         self.conclude(&identity, &request, decision)

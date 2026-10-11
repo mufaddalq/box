@@ -186,6 +186,30 @@ pub enum Request<'a> {
         /// Whether the request was seen through TLS interception (vs. tunneled).
         intercepted: bool,
     },
+    /// The body refinement of one L7 request to an egress route that declares body fields
+    /// (`<ns>::Action::"http_body"`), decided after [`Request::Http`] allowed it.
+    ///
+    /// The fixed fields repeat the `http:request` values. `input` holds `body_json` and each
+    /// declared field the strict extractor found; a body value never reaches the resource or an
+    /// observer.
+    HttpBody {
+        /// The route's policy namespace.
+        namespace: &'a str,
+        /// Destination host.
+        host: &'a str,
+        /// Destination port.
+        port: u16,
+        /// HTTP method (`GET`, `POST`, …).
+        method: &'a str,
+        /// Request path.
+        path: &'a str,
+        /// Request body length.
+        body_bytes: usize,
+        /// Whether the request was seen through TLS interception (vs. tunneled).
+        intercepted: bool,
+        /// `body_json` plus each present declared field, as the extractor returned them.
+        input: &'a serde_json::Value,
+    },
     /// One MCP request, with per-tool actions for `tools/call` and `mcp:call` for other methods.
     McpCall {
         /// Trusted server name from operator configuration.
@@ -258,6 +282,9 @@ impl Request<'_> {
             Request::Fs { path, .. } => path.reported().into_owned(),
             Request::Connect { host, port, .. } => format!("{host}:{port}"),
             Request::Http {
+                host, port, path, ..
+            }
+            | Request::HttpBody {
                 host, port, path, ..
             } => format!("{host}:{port}{path}"),
             Request::McpCall {

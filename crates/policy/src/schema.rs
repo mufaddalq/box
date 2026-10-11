@@ -10,6 +10,7 @@ use cedar_policy::{
 
 use crate::Principal;
 use crate::error::PolicyError;
+use crate::http_body::HTTP_BODY_ACTION;
 use crate::request::{DEFAULT_PRINCIPAL_ID, FsOperation, Request};
 
 const BOX_NAMESPACE: &str = "Box";
@@ -120,6 +121,7 @@ pub(crate) mod action {
 pub(crate) enum ActionIdentity {
     Fixed { id: &'static str },
     McpTool { namespace: String, tool: String },
+    HttpBody { namespace: String },
 }
 
 impl ActionIdentity {
@@ -131,6 +133,9 @@ impl ActionIdentity {
                 arguments: Some(_),
                 ..
             } => Self::mcp_tool(server, tool),
+            Request::HttpBody { namespace, .. } => Self::HttpBody {
+                namespace: (*namespace).to_string(),
+            },
             other => Self::Fixed {
                 id: action_id(other),
             },
@@ -156,6 +161,15 @@ impl ActionIdentity {
                     EntityId::new(tool),
                 ))
             }
+            Self::HttpBody { namespace } => {
+                let action_type = format!("{namespace}::Action")
+                    .parse::<EntityTypeName>()
+                    .map_err(|error| PolicyError::Schema(error.to_string()))?;
+                Ok(EntityUid::from_type_name_and_id(
+                    action_type,
+                    EntityId::new(HTTP_BODY_ACTION),
+                ))
+            }
         }
     }
 
@@ -169,6 +183,9 @@ impl ActionIdentity {
                 "{namespace}::Action::\"{}\"",
                 EntityId::new(tool).escaped()
             )),
+            Self::HttpBody { namespace } => {
+                Cow::Owned(format!("{namespace}::Action::\"{HTTP_BODY_ACTION}\""))
+            }
         }
     }
 }
@@ -422,6 +439,9 @@ pub(crate) fn action_id(req: &Request<'_>) -> &'static str {
         Request::Fs { operation, .. } => fs_action_id(*operation),
         Request::Connect { .. } => action::NET_CONNECT,
         Request::Http { .. } => action::HTTP_REQUEST,
+        // A body refinement uses [`ActionIdentity::HttpBody`]. Its context does not conform to
+        // `http:request`, so reaching this arm is a schema error and a deny.
+        Request::HttpBody { .. } => action::HTTP_REQUEST,
         Request::ShellExec { .. } => action::SHELL_EXEC,
         // A tool call with arguments uses [`ActionIdentity::McpTool`].
         Request::McpCall { .. } => action::MCP_CALL,
@@ -483,6 +503,13 @@ fn context_for(
         let input = serde_json::json!({ "input": arguments });
         return Context::from_json_value(input, Some((schema, action)))
             .map_err(|error| PolicyError::Schema(format!("invalid MCP tool arguments: {error}")));
+    }
+    // A body refinement carries the fixed request fields plus the extracted body fields. Cedar
+    // types them against the route's generated `HttpBodyInput`.
+    if let Request::HttpBody { .. } = req {
+        let input = serde_json::json!({ "input": http_body_input(req) });
+        return Context::from_json_value(input, Some((schema, action)))
+            .map_err(|error| PolicyError::Schema(format!("invalid http_body input: {error}")));
     }
     let input: Vec<(String, RestrictedExpression)> = match req {
         Request::Fs {
@@ -548,6 +575,8 @@ fn context_for(
                 RestrictedExpression::new_bool(*intercepted),
             ),
         ],
+        // Built above from `http_body_input`.
+        Request::HttpBody { .. } => Vec::new(),
         Request::McpCall {
             server,
             method,
@@ -638,6 +667,43 @@ fn context_for(
         .map_err(|e| PolicyError::Schema(format!("failed to build context.input: {e}")))?;
     Context::from_pairs([("input".to_string(), input_record)])
         .map_err(|e| PolicyError::Schema(format!("failed to build context: {e}")))
+}
+
+/// The `input` record of a [`Request::HttpBody`]: the six `http:request` fields, then every
+/// field the extractor returned. One builder for the Cedar context and the history event, so the
+/// two cannot disagree. Any other request yields an empty object.
+pub(crate) fn http_body_input(req: &Request<'_>) -> serde_json::Value {
+    let Request::HttpBody {
+        host,
+        port,
+        method,
+        path,
+        body_bytes,
+        intercepted,
+        input,
+        ..
+    } = req
+    else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let mut merged = serde_json::Map::new();
+    merged.insert(attr::HOST.into(), (*host).into());
+    merged.insert(attr::PORT.into(), (*port).into());
+    merged.insert(attr::METHOD.into(), (*method).into());
+    merged.insert(attr::PATH.into(), (*path).into());
+    merged.insert(
+        attr::BODY_BYTES.into(),
+        i64::try_from(*body_bytes).unwrap_or(i64::MAX).into(),
+    );
+    merged.insert(attr::INTERCEPTED.into(), (*intercepted).into());
+    if let Some(extracted) = input.as_object() {
+        merged.extend(
+            extracted
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    serde_json::Value::Object(merged)
 }
 
 fn usize_to_cedar_long(value: usize) -> Result<i64, PolicyError> {
