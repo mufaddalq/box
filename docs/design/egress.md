@@ -120,6 +120,17 @@ the body size, and whether the request came inside a `CONNECT`. The gateway puts
 canonical form first: it decodes only the percent-escapes for unreserved characters, so `%2F` stays
 encoded, removes `.` and `..` segments, and leaves out the query.
 
+**A route can refine `http:request` by its body.** When a request matches an `[egress.<name>]`
+route that declares `body.fields`, the gateway hands the policy the buffered body after
+`http:request` permits. The match is the one the credential uses, on the canonical path, so a body
+route and a credential route agree on which requests they cover. The policy parses the body
+strictly, reads each declared JSON Pointer, and decides `<route>::Action::"http_body"`. Only a
+`forbid` refuses, and a body that does not parse leaves every declared field absent, so the rule
+decides what an unparseable body means
+([a body condition is a declared refinement](./decisions.md#a-body-condition-is-a-declared-refinement)).
+The body reaches the decision and the history, and never the decision record a telemetry target
+receives.
+
 **The gateway opens TLS to the server last.** Only after `http:request` permits does it connect TLS
 to the server, verify the server's certificate against a compiled-in set of public root
 certificates, and forward the request. Each connection carries one request.

@@ -49,6 +49,15 @@ filesystem permit lets them reach paths the agent's own grants never could, incl
 stores ([no credential floor sits beneath the interpreters](decisions.md#no-credential-floor-sits-beneath-the-interpreters)).
 Keep filesystem permits to the paths the task needs.
 
+A body condition sees only what its route declares
+([a body condition is a declared refinement](decisions.md#a-body-condition-is-a-declared-refinement)).
+An upstream that also reads a scope from the query string or a header gets that scope unchecked,
+because the `http_body` action carries neither. Each field reads one location, so a scope repeated
+across an array of objects, such as `/filters/*/space`, can't be declared. An upstream with a
+lenient JSON parser can accept a body Box refuses to parse; with the documented rule form, that body
+is refused, which is the safe direction. The gateway can't tell which process in the box sent the
+request, so the condition applies to every process alike.
+
 ## How access choices change the risk
 
 Seven configuration choices widen what a program can reach without a policy decision for each

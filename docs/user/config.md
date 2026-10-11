@@ -455,7 +455,9 @@ A refusal of the file's shape happens at parse, before any box state exists: an 
 absent or invalid `name`, an absent or relative `box_dir`, an empty or relative `command` program, a
 relative `workspace`, an `env` name the box owns, a relative `env.HOME` or `env.TMPDIR`, a patterned
 or relative `filesystem` path, a `filesystem` path carrying `..`, a duplicated `filesystem` path, an
-overlapping or all-hosts egress destination, a secretless egress entry, and a literal egress secret.
+overlapping or all-hosts egress destination, a secretless egress entry, a literal egress secret, an
+empty `body.fields`, a `body.fields` entry with a bad pointer, type, or field name, and `body.fields`
+on a remote MCP server.
 
 A `box_dir` whose parent does not exist is refused before anything is created. Every other refusal
 that needs the surrounding OS happens after `run` has created `box_dir`, and before the workload

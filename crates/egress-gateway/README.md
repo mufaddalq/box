@@ -23,7 +23,7 @@ behind the `tls-intercept` feature:
 | Audit values | `AuditDecision`, `EgressDecision`, `NetworkAuditEvent`, `RequestId`, `SharedAuditLog` |
 | Boundary values | `BodyRef`, `DenyReason`, `HeaderMap`, `InterceptedRequest`, `InterceptedResponse`, `Mutation`, `MutationTarget`, `Target`, `Verdict` |
 | Credential mutators | `CapabilityContext`, `CapabilityFault`, `CapabilityOutcome`, `CapabilitySet`, `CapabilitySetBuilder`, `CredentialCapability` |
-| Effect lifecycle | `EffectAttempt`, `EffectInterceptor`, `EffectOutcome`, `EffectPermit` |
+| Effect lifecycle | `EffectAttempt`, `EffectInterceptor`, `EffectOutcome`, `EffectPermit`, `HttpBody` |
 | Interception port | `Interceptor` |
 | Audit seam | `Emitter`, `StubEmitter` |
 | Errors | `ProxyError`, `Result` |
@@ -55,12 +55,15 @@ kinds, and the proxy presents each one immediately before its effect:
 | Attempt | Fields | Reported when |
 |---|---|---|
 | `EffectAttempt::Connect` | `host`, `port`, `address`, `http_visibility` | before one upstream socket opens, once per pinned address |
-| `EffectAttempt::HttpRequest` | `host`, `port`, `method`, `path`, `body_bytes` | after the request is serialized, before it is written |
+| `EffectAttempt::HttpRequest` | `host`, `port`, `method`, `path`, `body_bytes`, `intercepted`, `mcp`, `body` | after the request is serialized, before it is written |
 | `EffectAttempt::ResponseRelease` | `host`, `port`, `method`, `path`, `status`, `body_bytes` | after response mutators run, before the workload receives bytes |
 
-No attempt carries a header, a body, or credential material. `path` excludes the
+No attempt carries a header or credential material. `path` excludes the
 query string and is the path the workload sent, captured before any credential
-edit. `body_bytes` is a length.
+edit. `body_bytes` is a length. `body` is an `HttpBody` only for a request that
+matched a `MitmConfig::body_routes` pattern: it carries the route name, the
+forwarded bytes, and whether a `Content-Encoding` other than `identity` was sent,
+and its `Debug` prints the length and never the bytes.
 
 Both `EffectPermit` methods consume `self: Box<Self>`, so one permit reaches
 exactly one terminal transition. The proxy reports `EffectOutcome::Connected`,
@@ -194,7 +197,7 @@ fn start() -> egress_gateway::Result<MitmHandle> {
 
 `EffectAttempt` is `#[non_exhaustive]`, so an implementation needs a wildcard arm.
 
-`MitmConfig` has eleven fields:
+`MitmConfig` has fourteen fields:
 
 | Field | Type | Default |
 |---|---|---|
@@ -210,6 +213,8 @@ fn start() -> egress_gateway::Result<MitmHandle> {
 | `dns_overrides` | `Vec<(String, IpAddr)>` | empty |
 | `upstream_read_deadline` | `Duration` | 300 s |
 | `max_connections` | `usize` | `256` |
+| `mcp_servers` | `Vec<(String, String)>` | empty |
+| `body_routes` | `Vec<(DestinationPattern, String)>` | empty |
 
 `unix_socket_path` selects the transport. `None` binds a localhost `TcpListener`
 at `bind_addr`; `Some(path)` binds only a `UnixListener`, at mode `0600`, and

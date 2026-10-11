@@ -1,7 +1,8 @@
 # The action vocabulary
 
 A rule names one action. The action decides which `context.input` fields the rule can read. The box
-ships ten actions, and generates one more for each MCP tool it discovers.
+ships ten actions. It generates one more for each MCP tool it discovers, and one for each egress
+route that declares body fields.
 
 Audience: an operator writing a `policy.dw` who needs the exact action name, its `context.input`
 fields, and which part of the box raises it. [Policy](../policy.md) introduces the rules, and
@@ -36,7 +37,7 @@ because only `fs:*` carries `operation`.
 
 ## The ten actions
 
-Ten actions in four categories, and one generated action per MCP tool:
+Ten actions in four categories, one generated action per MCP tool, and one per body route:
 
 - **[Filesystem](#filesystem)**, raised by Strands Shell (the box's shell) and by Monty (the box's
   Python interpreter).
@@ -50,6 +51,8 @@ Ten actions in four categories, and one generated action per MCP tool:
 - **[Network](#network)**, raised by the egress gateway.
   - `net:connect`: each connection, before TLS.
   - `http:request`: each HTTP request inside the connection, after TLS on an HTTPS connection.
+  - `<route>::Action::"http_body"`: a request to an `[egress.<name>]` route with `body.fields`,
+    after `http:request` permitted it.
 - **[Shell](#shell)**, raised by Strands Shell.
   - `shell:exec`: a command line that runs a program the shell implements, such as `cat` or `grep`.
   - `shell:spawn`: a command line that runs a program of the surrounding OS, such as `git`. The box
@@ -123,6 +126,54 @@ with `the types String and ipaddr are not compatible`.
 
 Cloud metadata and link-local protection is two `forbid` rules on `net:connect`;
 [what Box always enforces](../security.md#what-box-always-enforces) lists them.
+
+<a id="http-body"></a>
+**A generated per-route action**, `<route>::Action::"http_body"`, once per request to an
+`[egress.<name>]` route that declares `body.fields` ([egress](../egress.md#body-fields)). The
+gateway raises it on every request to the route, with or without a body, after `http:request`
+permitted the request. Its fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `host`, `port`, `method`, `path`, `body_bytes`, `intercepted` | As `http:request` | The values `http:request` decided. |
+| `body_json` | Bool | `true` when the body parsed as strict JSON. |
+| Each declared field `<name>?` | The declared type | The value at the field's pointer. Present only when `body_json` is `true` and the value has the declared type. |
+
+The namespace is the route name, changed with the rule for an MCP server name. Route `wiki` gives
+`wiki::Action::"http_body"`.
+
+The action is a refinement. Only a `forbid` that matches refuses the request. When no rule matches,
+the `http:request` verdict stands. A refusal is the gateway's `403` with
+`x-strands-box-egress: refused`, and its reason names the action and no body value.
+
+`body_json` is `false`, and no declared field is set, when the body is any of these:
+
+- empty
+- sent with a `Content-Encoding` other than `identity`
+- larger than 1 MiB
+- not one strict JSON text: a comment, a trailing comma, a leading byte-order mark, or bytes after
+  the value
+- an object that repeats a key, at any depth
+- nested deeper than 64
+
+A `string`, `long`, or `bool` field is set when the pointer finds that JSON type. A `long` is an
+integer in the 64-bit range, so `1.0` and `1e3` leave the field absent. A `set<string>` or
+`set<long>` field is set from an array whose every element has the element type, or from one value
+of that type.
+
+Write the rule so that an unparseable body is refused:
+
+```text
+@id("wiki_search_scope")
+forbid (principal, action == wiki::Action::"http_body", resource)
+when   { context.input.method == "POST" && context.input.path == "/rest/search" }
+unless { context.input.body_json && context.input has spaces &&
+         ["eng", "docs"].containsAll(context.input.spaces) };
+```
+
+A rule of the form `when { context.input has spaces && !["eng", "docs"].containsAll(context.input.spaces) }`
+matches nothing when the body does not parse, because the field is absent. The request then rides
+the `http:request` permit with its scope unchecked.
 
 ## Shell
 
@@ -226,6 +277,7 @@ What each caller records as a response:
 | `http:request` | At reply time, once per exchange | `status`: the upstream's reply status |
 | `shell:exec`, `shell:spawn` | When the command ends | `status`: the exit status. When a signal ends the command, `status` is `128` plus the signal number. |
 | `mcp:call` | When a `tools/call`, `prompts/get`, or `resources/read` completes | none |
+| `<route>::Action::"http_body"` | None: the action records `::request` only | The reply's `status` is on `http:request`. |
 
 Each temporal operator carries a window of at most `24h`. A temporal predicate names exactly one
 action, so a budget that spans `fs:read` and `fs:write` is one clause per action.

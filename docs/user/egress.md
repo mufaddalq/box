@@ -57,6 +57,9 @@ when { context.input.host == "api.github.com" };
 | `secret.param` | string | none | For `env://` with `placement = "query_param"`: the query parameter name. Required for that placement. |
 | `secret.inject` | string | `phantom` | For `env://`: `phantom` adds the credential only to a request that carries the placeholder, and refuses any other request to the destinations. `always` adds it to every request to the destinations. |
 | `secret.phantom_prefix` | string | `strands_box_` | For `env://`: the start of the placeholder, such as `sk-ant-` for a client that checks the key's format. 1 to 64 letters, digits, `-`, `_`, `.`, or `~`. |
+| `body.fields` | table | none | The request-body fields a rule reads through the route's `http_body` action. At least one field. See [Body fields](#body-fields). |
+| `body.fields.<name>.pointer` | string | required | A JSON Pointer into the request body, such as `/filter/spaces`. It starts with `/`. An array index, such as `/filters/0/space`, is allowed. |
+| `body.fields.<name>.type` | string | required | `string`, `long`, `bool`, `set<string>`, or `set<long>`. |
 
 ### Placement
 
@@ -81,6 +84,30 @@ Each entry in `destinations` is a host, with an optional port and path.
 A host is matched in lowercase. A path is matched case-sensitively, against the path in the
 gateway's canonical form. Two routes, or two entries in one route, can't match the same
 destination, and an http MCP server's host can't appear in a route.
+
+<a id="body-fields"></a>
+## Body fields
+
+To decide a request by a value in its JSON body, declare the field on the route and write a rule
+on the route's `http_body` action. This route reads the spaces a wiki search names:
+
+```toml
+[egress.wiki]
+destinations = ["wiki.example.com"]
+secret.ref   = "env://WIKI_TOKEN"
+
+[egress.wiki.body.fields]
+spaces = { pointer = "/filter/spaces", type = "set<string>" }
+```
+
+The gateway then raises `wiki::Action::"http_body"` on each request to the route, after
+`http:request` permitted it. `context.input.spaces` holds the array at `/filter/spaces`. A field
+name is a letter or `_`, then letters, digits, or `_`. It can't be a field the action already has
+(`host`, `port`, `method`, `path`, `body_bytes`, `intercepted`, or `body_json`) or a policy keyword.
+
+[The `http_body` action](./policy/actions.md#http-body) lists its fields, how the body is parsed,
+and the rule form that refuses a body the gateway can't parse. A request on another path of the
+route, such as an upload, still passes that rule.
 
 ## Credential sources
 
@@ -114,6 +141,8 @@ names is refused.
 | `header` is not a valid header name, or `prefix` holds a control character or a brace | Use a plain header name and prefix. |
 | `inject` is a value other than `phantom` or `always` | Use `phantom` or `always`. |
 | `phantom_prefix` is empty, longer than 64 characters, or holds another character | Use 1 to 64 letters, digits, `-`, `_`, `.`, or `~`. |
+| `body.fields` is empty, or a field has a bad name, a pointer that does not start with `/`, or an unknown type | Declare at least one field, with a valid name, pointer, and type. |
+| `body.fields` sits on a remote MCP server | Remove it. A remote MCP server's tool calls have their own typed actions. |
 
 A request the gateway refuses while the box runs gets an HTTP 403 with the header
 `x-strands-box-egress: refused`. The body says why:
@@ -121,6 +150,7 @@ A request the gateway refuses while the box runs gets an HTTP 403 with the heade
 | Body | Cause |
 |---|---|
 | The policy decision, naming the rule | `net:connect` or `http:request` refused the request. |
+| `http_body gate (<route>::Action::"http_body")`, then the policy decision | A rule on the route's `http_body` action refused the request. |
 | `blocked by egress control` | A request to a route's destinations lacks the placeholder, carries a different value, or can't be signed. |
 | `credential not permitted on a plaintext request` | A plain `http://` request went to a route's destination. |
 | `request authority rejected` | The request inside a `CONNECT` named a different host. |

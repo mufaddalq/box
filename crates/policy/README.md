@@ -194,6 +194,12 @@ every `fs:*` action carries `operation`, while network and shell inputs do not.
 | `ShellExec` | `Box::Action::"shell:exec"` | `command`, `program`, `args`, `cwd` |
 | `ShellSpawn` | `Box::Action::"shell:spawn"` | the same, plus `program_path` |
 | `McpCall` | `Box::Action::"mcp:call"`, or `<normalized-server>::Action::"<tool>"` when `tool` and `arguments` are present | `server`, `method`, `tool`, `prompt`, `uri`, `arguments` |
+| `HttpBody` | `<normalized-route>::Action::"http_body"` | `namespace`, the six `Http` fields, and `input: &serde_json::Value` (`body_json` and each declared field) |
+
+`PolicyEngine::refine_http_body` builds `HttpBody` from an `HttpBodyRoute` and the raw body, and
+decides it as a forbid-only refinement after `http:request`. Open the engine with
+`open_staged_with_body_routes` (or `open_staged_file_with_body_routes`), so each route's
+`generate_http_body_schema` fragment is in the schema from the first validation.
 
 There is no response-leg variant. `ResponseRelease` was one. The response leg raises no
 decision and records no event, so a rule cannot read a response's attributes.

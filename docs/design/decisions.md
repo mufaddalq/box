@@ -1561,6 +1561,27 @@ discovery methods carry the server, so a rule can gate them. The gateway must te
 frames, so a remote MCP server's traffic is buffered and not streamed. The credential controls stay
 deny-only beneath policy, so the classifier adds no allow authority.
 
+<a id="a-body-condition-is-a-declared-refinement"></a>
+### A body condition is a declared refinement, and an unparseable body leaves its fields absent
+
+The operator declares JSON body fields on an `[egress.<name>]` route as a JSON Pointer and a type,
+and the box generates one `<route>::Action::"http_body"` action for the route from `box.toml`
+alone. The gateway decides it after `http:request` permits, and only a `forbid` refuses, as the
+per-tool MCP refinement does. A body that is not one strict JSON text, or that repeats a key,
+sets `body_json` to `false` and leaves every declared field absent, so the rule decides; the
+documented form refuses it. A set of `pointer=value` strings on `http:request` was rejected,
+because it cannot say "every element is allowed" and it copies every body value into history. A
+new top-level table was rejected, because it adds a ninth frozen key, so a body route also needs
+a secret. A box-wide refusal of an unparseable body was rejected, because destinations cannot
+overlap and it would refuse every non-JSON request to the host. An allow-list in `box.toml` was
+rejected, because the authored policy is the only authorizer.
+
+The action records `::request` only, with the declared field values, because the history refuses a
+changed event schema; the reply's status stays on `http:request`. A rule that guards only on
+`has <field>` matches nothing on an unparseable body and lets the request ride the coarse permit.
+`the_documented_form_refuses_an_unparseable_body` and `a_duplicate_key_smuggle_is_refused` pin
+the fail-closed form.
+
 <a id="remote-tool-schemas-are-discovered-at-runtime-in-memory"></a>
 ### The box discovers a remote MCP server's tool schemas at runtime, in memory
 

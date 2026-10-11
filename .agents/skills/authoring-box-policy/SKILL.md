@@ -84,6 +84,7 @@ The actions are a closed set. A policy names one; it cannot add one. The last co
 | `shell:spawn` | the `shell:exec` fields plus `program_path: String`, and the same `output.status`. The workload can set a `shell:exec` status (a shell function of the same name does it), so a precondition on a host binary's success reads `shell:spawn` and pins `program_path` |
 | `mcp:call` | `server`, `method`, `tool?`, `prompt?`, `uri?` |
 | `<server>::Action::"<tool>"` | per-tool, emitted by `box policy generate-schema` |
+| `<route>::Action::"http_body"` | for an `[egress.<route>]` with `body.fields`: the six `http:request` fields, `body_json: Bool`, and each declared field as optional (`spaces?: Set<String>`); records `::request` only |
 
 **Filesystem `operation` enums** (narrow within an `fs:` action):
 `FsReadOperation` = `read_content`, `read_metadata`, `enumerate`, `read_link`, `change_dir`, `exec`;
@@ -319,6 +320,12 @@ Point the operator at the bundled `examples/`; these are the patterns that recur
   `examples/forbid-delete.dw`.
 - **Guard a shell command.** A `forbid` on `shell:exec` with a `has`-guarded argument read. See
   `examples/shell-guard.dw`.
+- **Scope a request by its JSON body.** Declare the field on the route
+  (`[egress.wiki.body.fields] spaces = { pointer = "/filter/spaces", type = "set<string>" }`), then
+  `forbid` on `wiki::Action::"http_body"` with the condition in an `unless` that requires
+  `context.input.body_json && context.input has spaces` before the allowed-set check. A body that
+  does not parse (duplicate key, encoded, over 1 MiB, deeper than 64) has `body_json = false` and no
+  declared field, so that form refuses it.
 - **Bound a rate or a budget.** A `forbid` with a `when temporal { … }` count over one action, keyed
   on `::response`, that fires at or above the cap. A permit cannot narrow another permit, so a cap is
   a `forbid`. See `examples/temporal-write-budget.dw`.
@@ -335,6 +342,8 @@ Point the operator at the bundled `examples/`; these are the patterns that recur
 - Do not key a temporal step-up on `::request`, and do not read `ip` in a temporal predicate.
 - Do not write a budget as a `permit` beside another permit for the same action; the box refuses it
   at load, because the permit cannot narrow the other one.
+- Do not write a body condition as `when { context.input has spaces && !… }`. An unparseable body
+  has no `spaces`, so the rule matches nothing and the request rides the `http:request` permit.
 - Do not present a policy you have not loaded into the box.
 - Do not ship a `forbid` without a `@description`. The agent reads that string on a denial, so an
   absent one leaves it to retry the same request.
