@@ -544,3 +544,106 @@ fn a_host_wildcard_admits_the_subdomain_and_refuses_the_apex_until_a_clause_name
         assert_default_denied(&apex_named_too, host);
     }
 }
+
+fn body_interceptor(src: &str) -> (tempfile::TempDir, Arc<dyn EffectInterceptor>) {
+    let dir = tempfile::tempdir().unwrap();
+    let route = policy::HttpBodyRoute::new(
+        "wiki",
+        [(
+            "spaces".into(),
+            "/filter/spaces".into(),
+            "set<string>".into(),
+        )],
+    )
+    .unwrap();
+    let engine = policy::PolicyEngine::open_staged_with_body_routes(
+        &policy::Operator::unanchored(),
+        sources(src),
+        vec![route],
+        &dir.path().join("h.redb"),
+    )
+    .unwrap();
+    (dir, interceptor_from(engine))
+}
+
+fn body_attempt<'a>(path: &'a str, body: &'a [u8]) -> EffectAttempt<'a> {
+    EffectAttempt::HttpRequest {
+        host: "wiki.example.com",
+        port: 443,
+        method: "POST",
+        path,
+        body_bytes: body.len(),
+        intercepted: true,
+        mcp: None,
+        body: Some(egress_gateway::HttpBody::new("wiki", body, false)),
+    }
+}
+
+const SCOPED: &str = r#"
+permit (principal, action == Box::Action::"http:request", resource)
+when { context.input.host == "wiki.example.com" };
+forbid (principal, action == wiki::Action::"http_body", resource)
+when   { context.input.path == "/rest/search" }
+unless { context.input.body_json && context.input has spaces &&
+         ["eng"].containsAll(context.input.spaces) };
+"#;
+
+#[test]
+fn the_body_gate_refines_an_allowed_http_request_by_a_declared_field() {
+    let (_d, i) = body_interceptor(SCOPED);
+    assert!(
+        i.intercept(&body_attempt(
+            "/rest/search",
+            br#"{"filter":{"spaces":["eng"]}}"#
+        ))
+        .is_ok()
+    );
+    let refused = i
+        .intercept(&body_attempt(
+            "/rest/search",
+            br#"{"filter":{"spaces":["body-secret"]}}"#,
+        ))
+        .err()
+        .expect("a foreign space is refused")
+        .to_string();
+    assert!(refused.contains("http_body gate"), "{refused}");
+    assert!(
+        refused.contains(r#"wiki::Action::"http_body""#),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("body-secret"),
+        "no body value in the reason: {refused}"
+    );
+}
+
+#[test]
+fn the_body_gate_is_reached_only_after_http_request_passes() {
+    let (_d, i) = body_interceptor(&SCOPED.replace("wiki.example.com", "elsewhere"));
+    let refused = i
+        .intercept(&body_attempt(
+            "/rest/search",
+            br#"{"filter":{"spaces":["eng"]}}"#,
+        ))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("http:request gate"), "{refused}");
+    assert!(!refused.contains("http_body gate"), "{refused}");
+}
+
+#[test]
+fn a_request_with_no_body_view_raises_no_body_decision() {
+    let (_d, i) = body_interceptor(SCOPED);
+    let attempt = EffectAttempt::HttpRequest {
+        host: "wiki.example.com",
+        port: 443,
+        method: "POST",
+        path: "/rest/search",
+        body_bytes: 0,
+        intercepted: true,
+        mcp: None,
+        body: None,
+    };
+    assert!(i.intercept(&attempt).is_ok());
+}

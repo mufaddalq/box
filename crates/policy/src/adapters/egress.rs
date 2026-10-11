@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use egress_gateway::{
     EffectAttempt as EgressEffectAttempt, EffectInterceptor as EgressEffectInterceptor,
-    EffectOutcome as EgressEffectOutcome, EffectPermit as EgressEffectPermit, McpFrame,
+    EffectOutcome as EgressEffectOutcome, EffectPermit as EgressEffectPermit, HttpBody, McpFrame,
     McpListReply,
 };
 
 use crate::GovernedBox;
+use crate::http_body::HTTP_BODY_ACTION;
+use crate::schema::mcp_action_namespace;
 use crate::{
     CatalogRefusal, CatalogStage, DiscoveryFailure, ListPage, McpServerKind, ToolCatalogs,
 };
@@ -102,6 +104,48 @@ impl EgressPolicyInterceptor {
 
     /// The two MCP gates on an allowed `http:request`: `mcp:call` identity, then the per-tool typed
     /// refinement. A non-MCP request carries no frame and passes.
+    /// The `http_body` refinement of an allowed `http:request`, for a request the gateway matched
+    /// to a body route. Forbid-only: no matching rule leaves the allow standing. The reason names
+    /// the action and never quotes the body.
+    #[allow(clippy::too_many_arguments)]
+    fn body_gate(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        body_bytes: usize,
+        intercepted: bool,
+        body: &Option<HttpBody<'_>>,
+    ) -> Result<(), String> {
+        let Some(body) = body else { return Ok(()) };
+        match self.policy.refine_http_body(
+            &self.governed,
+            &self.principal,
+            body.route(),
+            host,
+            port,
+            method,
+            path,
+            body_bytes,
+            intercepted,
+            body.bytes(),
+            body.encoded(),
+        ) {
+            Decision::Allow { .. } => Ok(()),
+            decision @ Decision::Deny { .. } => {
+                let action = format!(
+                    "{}::Action::\"{HTTP_BODY_ACTION}\"",
+                    mcp_action_namespace(body.route())
+                );
+                Err(format!(
+                    "http_body gate ({}): {decision}",
+                    diagnostic_context(&action)
+                ))
+            }
+        }
+    }
+
     fn mcp_gates(&self, mcp: &Option<McpFrame<'_>>) -> Result<(), String> {
         let Some(frame) = mcp else { return Ok(()) };
         // Gate one: `mcp:call` (identity). `{:?}` quotes the server and method, so a hostile
@@ -215,7 +259,7 @@ impl EgressEffectInterceptor for EgressPolicyInterceptor {
                 body_bytes,
                 intercepted,
                 mcp,
-                body: _,
+                body,
             } => {
                 // The `http:request` gate. `decide` records to history, so it is called exactly
                 // once here; the `mcp:call` gate below is the second recorded decision.
@@ -251,8 +295,11 @@ impl EgressEffectInterceptor for EgressPolicyInterceptor {
                     decision @ Decision::Deny { .. } => {
                         Err(format!("http:request gate: {decision}"))
                     }
-                    // Allowed; the `mcp:call` gate and per-tool refinement run on the Ready authority.
-                    Decision::Allow { .. } => self.mcp_gates(mcp),
+                    // Allowed; the `mcp:call` gate and per-tool refinement run on the Ready authority,
+                    // then the route's body refinement.
+                    Decision::Allow { .. } => self.mcp_gates(mcp).and_then(|()| {
+                        self.body_gate(host, *port, method, path, *body_bytes, *intercepted, body)
+                    }),
                 }
             }
             // The release of a reply to the workload decides nothing and records nothing. The
