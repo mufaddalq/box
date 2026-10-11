@@ -102,8 +102,6 @@ impl EgressPolicyInterceptor {
         }
     }
 
-    /// The two MCP gates on an allowed `http:request`: `mcp:call` identity, then the per-tool typed
-    /// refinement. A non-MCP request carries no frame and passes.
     /// The `http_body` refinement of an allowed `http:request`, for a request the gateway matched
     /// to a body route. Forbid-only: no matching rule leaves the allow standing. The reason names
     /// the action and never quotes the body.
@@ -146,6 +144,8 @@ impl EgressPolicyInterceptor {
         }
     }
 
+    /// The two MCP gates on an allowed `http:request`: `mcp:call` identity, then the per-tool typed
+    /// refinement. A non-MCP request carries no frame and passes.
     fn mcp_gates(&self, mcp: &Option<McpFrame<'_>>) -> Result<(), String> {
         let Some(frame) = mcp else { return Ok(()) };
         // Gate one: `mcp:call` (identity). `{:?}` quotes the server and method, so a hostile

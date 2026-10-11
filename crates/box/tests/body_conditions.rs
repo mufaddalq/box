@@ -186,14 +186,14 @@ fn a_foreign_or_mixed_space_is_refused_before_the_upstream() {
 #[test]
 fn a_duplicate_key_smuggle_is_refused() {
     let wiki = body_box(true);
-    assert_eq!(
-        wiki.status(
-            "/rest/search",
-            &[],
-            br#"{"filter":{"spaces":["eng"],"spaces":["secret"]}}"#
-        ),
-        403
-    );
+    // Both orders: a last-key-wins check would see `eng` in the second and send `secret` on to a
+    // first-key-wins upstream.
+    for body in [
+        &br#"{"filter":{"spaces":["eng"],"spaces":["secret"]}}"#[..],
+        br#"{"filter":{"spaces":["secret"],"spaces":["eng"]}}"#,
+    ] {
+        assert_eq!(wiki.status("/rest/search", &[], body), 403);
+    }
     assert_eq!(wiki.upstream.request_count(), 0);
 }
 

@@ -128,8 +128,8 @@ strictly, reads each declared JSON Pointer, and decides `<route>::Action::"http_
 `forbid` refuses, and a body that does not parse leaves every declared field absent, so the rule
 decides what an unparseable body means
 ([a body condition is a declared refinement](./decisions.md#a-body-condition-is-a-declared-refinement)).
-The body reaches the decision and the history, and never the decision record a telemetry target
-receives.
+The declared field values reach the decision and the history. The body itself is stored nowhere,
+and the decision record a telemetry target receives carries no field value.
 
 **The gateway opens TLS to the server last.** Only after `http:request` permits does it connect TLS
 to the server, verify the server's certificate against a compiled-in set of public root

@@ -133,6 +133,42 @@ pub(super) fn body_routes(
         .collect()
 }
 
+/// Refuse a body route whose policy namespace an MCP server's name also normalizes to. The
+/// namespace comes from the policy crate's own normalization, so the two cannot disagree.
+pub(super) fn refuse_body_namespace_clash<'a>(
+    entries: &BTreeMap<String, EgressEntry>,
+    servers: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ConfigError> {
+    let routes = body_routes(entries)?;
+    for server in servers {
+        // A one-field probe route spells the server's namespace; a name that normalizes to `Box`
+        // is refused where the server is declared.
+        let probe = [("f".to_string(), "/f".to_string(), "long".to_string())];
+        let Ok(spelled) = policy::HttpBodyRoute::new(server, probe) else {
+            continue;
+        };
+        if let Some(route) = routes
+            .iter()
+            .find(|route| route.namespace() == spelled.namespace())
+        {
+            let name = route.route();
+            return Err(ConfigError::Credential {
+                host: entries[name]
+                    .destinations
+                    .first()
+                    .cloned()
+                    .unwrap_or_default(),
+                reason: format!(
+                    "`[egress.{name}] body.fields` and `[mcp.{server}]` share the policy \
+                     namespace `{}`; rename one of them",
+                    route.namespace()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// One `(pattern, route name)` pair per destination of each entry that declares `body.fields`,
 /// parsed exactly as its credential route is, so the gateway reads a body where the credential
 /// attaches.

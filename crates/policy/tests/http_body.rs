@@ -102,6 +102,8 @@ fn the_documented_form_refuses_an_unparseable_body() {
     let (_d, e) = engine(SAFE, vec![wiki()]);
     for body in [
         &br#"{"filter":{"spaces":["eng"],"spaces":["secret"]}}"#[..],
+        // A first-key-wins upstream reads `secret`; a last-key-wins parser would see `eng`.
+        br#"{"filter":{"spaces":["secret"],"spaces":["eng"]}}"#,
         b"spaces=eng",
         b"",
     ] {

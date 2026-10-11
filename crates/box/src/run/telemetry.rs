@@ -501,23 +501,41 @@ fn ordinary_egress_decision(
     refusal: Option<String>,
     observations: &[ObservedDecision],
 ) -> EffectiveDecision {
-    let determined = observations.last();
+    // A body route decides its `http_body` refinement last. A refusal there is its own record; a
+    // permit is the `http:request` rule's, because the refinement only forbids.
+    let body = observations
+        .last()
+        .filter(|observed| observed.action.ends_with(BODY_ACTION_SUFFIX));
     match refusal {
-        Some(refusal) => EffectiveDecision::gate_deny(
-            identity.action(),
-            identity.resource(),
-            "egress",
-            refusal,
-            determined,
-        ),
+        Some(refusal) => match body.filter(|observed| !observed.decision.is_allow()) {
+            Some(observed) => EffectiveDecision::from_policy(
+                &observed.action,
+                &observed.resource,
+                &observed.decision,
+            ),
+            None => EffectiveDecision::gate_deny(
+                identity.action(),
+                identity.resource(),
+                "egress",
+                refusal,
+                observations.last(),
+            ),
+        },
         None => EffectiveDecision::gate_permit(
             identity.action(),
             identity.resource(),
             "egress",
-            determined,
+            if body.is_some() {
+                observations.iter().rev().nth(1)
+            } else {
+                observations.last()
+            },
         ),
     }
 }
+
+/// How the observer spells every route's `<ns>::Action::"http_body"`.
+const BODY_ACTION_SUFFIX: &str = r#"::Action::"http_body""#;
 
 fn remote_mcp_decision(
     frame: &McpFrame<'_>,
@@ -1344,6 +1362,103 @@ mod tests {
         );
         assert_eq!(bootstrapped.cause(), DecisionCause::Enforcement);
         assert!(bootstrapped.attribution().is_empty());
+    }
+
+    /// A body route's refinement credits a permit to the `http:request` rule that granted it, and
+    /// records a refusal under the route's `http_body` action.
+    #[test]
+    fn a_body_route_records_the_coarse_permit_and_its_own_refusal() {
+        let history = tempfile::tempdir().expect("history directory");
+        let route = policy::HttpBodyRoute::new(
+            "wiki",
+            [(
+                "spaces".to_string(),
+                "/filter/spaces".to_string(),
+                "set<string>".to_string(),
+            )],
+        )
+        .expect("a valid route");
+        let policy = PolicyEngine::open_staged_with_body_routes(
+            &policy::Operator::unanchored(),
+            vec![Policy {
+                origin: PathBuf::from("body-route-telemetry.cedar"),
+                text: r#"
+                    @id("post-to-wiki")
+                    permit(principal, action == Box::Action::"http:request", resource)
+                    when { context.input.host == "wiki.example.com" };
+                    @id("wiki_scope")
+                    forbid(principal, action == wiki::Action::"http_body", resource)
+                    unless { context.input.body_json && context.input has spaces &&
+                             ["eng"].containsAll(context.input.spaces) };
+                "#
+                .to_string(),
+            }],
+            vec![route],
+            &history.path().join("dogwood.redb"),
+        )
+        .expect("policy opens")
+        .observed_by(Arc::new(PolicyDecisionObserver));
+        let interceptor = EgressDecisionInterceptor::over(EgressPolicyInterceptor::into_handle(
+            Arc::new(policy),
+            Principal::agent(),
+            GovernedBox::assigned("test-box"),
+        ));
+        let recorder = DecisionRecorder::discarding();
+        let emitter = EgressDecisionRecorder::over(Arc::clone(&recorder));
+        let attempt = |body: &'static [u8]| EgressEffectAttempt::HttpRequest {
+            host: "wiki.example.com",
+            port: 443,
+            method: "POST",
+            path: "/rest/search",
+            body_bytes: body.len(),
+            intercepted: true,
+            mcp: None,
+            body: Some(egress_gateway::HttpBody::new("wiki", body, false)),
+        };
+        let emit = |decision: AuditDecision, reason: String, id: &str| {
+            emitter.emit(EgressDecision {
+                host: "wiki.example.com".to_string(),
+                port: 443,
+                method: "POST".to_string(),
+                path: "/rest/search".to_string(),
+                decision,
+                reason,
+                correlation: RequestId::new(id),
+            });
+        };
+
+        interceptor
+            .intercept(&attempt(br#"{"filter":{"spaces":["eng"]}}"#))
+            .expect("an allowed space is admitted")
+            .mark_indeterminate();
+        emit(AuditDecision::Allow, String::new(), "allowed");
+        let refusal = interceptor
+            .intercept(&attempt(br#"{"filter":{"spaces":["secret"]}}"#))
+            .err()
+            .expect("a foreign space is refused");
+        emit(AuditDecision::Deny, refusal.to_string(), "refused");
+
+        let recorded = recorder.recorded();
+        assert_eq!(recorded.len(), 2);
+        let (action, _, rule, verdict, _) = recorded[0].parts();
+        assert_eq!(action, r#"Box::Action::"http:request""#);
+        assert_eq!(verdict, EffectiveVerdict::Permit);
+        assert!(
+            matches!(rule, EffectiveRule::Policy(id) if id.as_str() != RuleId::DEFAULT_DENY),
+            "{rule:?}"
+        );
+        let [attribution] = recorded[0].attribution() else {
+            panic!("one determining policy");
+        };
+        assert_eq!(attribution.annotation_id.as_deref(), Some("post-to-wiki"));
+
+        let (action, _, _, verdict, _) = recorded[1].parts();
+        assert_eq!(action, r#"wiki::Action::"http_body""#);
+        assert_eq!(verdict, EffectiveVerdict::Deny);
+        let [attribution] = recorded[1].attribution() else {
+            panic!("one determining policy");
+        };
+        assert_eq!(attribution.annotation_id.as_deref(), Some("wiki_scope"));
     }
 
     /// **An authored `@id` is the identifier, and the engine's rule identifier is the fallback.**

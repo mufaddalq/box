@@ -43,7 +43,8 @@ use crate::error::{BoxError, ConfigError};
 use self::egress::routes_for;
 use self::egress::{
     EgressEntry, EgressRoute, Protocol, body_route_patterns, body_routes, host_of,
-    routes_for_and_remote, validate_egress, validate_egress_and_remote,
+    refuse_body_namespace_clash, routes_for_and_remote, validate_egress,
+    validate_egress_and_remote,
 };
 #[cfg(test)]
 use self::env::{LOADER_HOOK_PREFIXES, LOADER_HOOKS};
@@ -443,6 +444,7 @@ impl RunContract {
             })
             .collect();
         validate_egress_and_remote(&egress, &remote_mcp)?;
+        refuse_body_namespace_clash(&egress, self.file.mcp.keys().map(String::as_str))?;
         let _ = routes_for_and_remote(&egress, &remote_mcp)?;
         let mut sources = vec![self.source];
         if let Some(source) = policy_source {
@@ -2492,6 +2494,27 @@ env = {}
             .expect("the remote MCP server [mcp.foo] is stored");
         assert_eq!(remote.destinations, ["api.githubcopilot.com"]);
         assert_eq!(remote.protocol, Protocol::Mcp);
+    }
+
+    /// A body route and an MCP server whose names normalize to one policy namespace are refused,
+    /// for a local and for a remote server.
+    #[test]
+    fn a_body_route_sharing_an_mcp_servers_namespace_is_refused() {
+        for server in [
+            "[mcp.wiki-search]\ntype = \"stdio\"\ncommand = [\"true\"]\n",
+            "[mcp.wiki-search]\ntype = \"http\"\ndestinations = [\"mcp.example.com\"]\n",
+        ] {
+            let error = record_from_config(&format!(
+                "[egress.wiki_search]\ndestinations = [\"wiki.example.com\"]\n\
+                 secret.ref = \"aws://prod\"\n\
+                 body.fields.f = {{ pointer = \"/a\", type = \"long\" }}\n{server}"
+            ))
+            .expect_err("one namespace cannot hold both");
+            assert!(
+                error.to_string().contains("namespace `wiki_search`"),
+                "{error}"
+            );
+        }
     }
 
     /// `[egress.*]` and a remote `[mcp.*]` pointing at the SAME host are refused: the gateway routes a

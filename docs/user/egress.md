@@ -143,6 +143,7 @@ names is refused.
 | `phantom_prefix` is empty, longer than 64 characters, or holds another character | Use 1 to 64 letters, digits, `-`, `_`, `.`, or `~`. |
 | `body.fields` is empty, or a field has a bad name, a pointer that does not start with `/`, or an unknown type | Declare at least one field, with a valid name, pointer, and type. |
 | `body.fields` sits on a remote MCP server | Remove it. A remote MCP server's tool calls have their own typed actions. |
+| A route with `body.fields` and an `[mcp.<name>]` server normalize to one policy namespace | Rename one of them. |
 
 A request the gateway refuses while the box runs gets an HTTP 403 with the header
 `x-strands-box-egress: refused`. The body says why:
